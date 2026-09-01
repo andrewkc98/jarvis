@@ -3,3 +3,7 @@ __pycache__/
 *.py[cod]
 .venv/
 node_modules/
+.pytest_cache/
+*.egg-info/
+*.onnx
+*.onnx.json
