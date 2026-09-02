@@ -1,8 +1,19 @@
 """Command-line entry point for a single Jarvis interaction."""
 
 import argparse
+import asyncio
 
 from jarvis.orchestrator.service import JarvisService
+
+
+async def _amain(args) -> str:
+    service = JarvisService(voice_model_path=args.voice_model)
+    try:
+        if args.text is not None:
+            return await service.arun_text(args.text)
+        return await service.arun_once()
+    finally:
+        await service.aclose()
 
 
 def main(argv=None) -> None:
@@ -18,11 +29,7 @@ def main(argv=None) -> None:
     )
     args = parser.parse_args(argv)
 
-    service = JarvisService(voice_model_path=args.voice_model)
-    if args.text is not None:
-        response = service.run_text(args.text)
-    else:
-        response = service.run_once()
+    response = asyncio.run(_amain(args))
     print(response)
 
 

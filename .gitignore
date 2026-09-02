@@ -7,3 +7,5 @@ node_modules/
 *.egg-info/
 *.onnx
 *.onnx.json
+mcp-config.json
+.env

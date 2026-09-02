@@ -11,6 +11,10 @@ dependencies = [
     "piper-tts",
     "sounddevice",
     "numpy",
+    "httpx",
+    "keyring",
+    "pyobjc-framework-EventKit",
+    "claude-agent-sdk==0.2.151",
 ]
 
 [project.optional-dependencies]
