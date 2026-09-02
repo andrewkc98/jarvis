@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from unittest.mock import Mock
 
 import numpy as np
@@ -61,7 +62,7 @@ def test_speak_stream_propagates_producer_error_after_draining_the_queue():
         assert "stream broke" in str(error)
     else:
         raise AssertionError("expected RuntimeError")
-    assert speaker.calls == []
+    assert speaker.calls == ["Partial"]
 
 
 def test_speak_stream_flushes_trailing_text_without_terminal_punctuation():
@@ -83,6 +84,24 @@ def test_speak_stream_returns_full_text_even_with_multiple_sentences():
     result = asyncio.run(_speak_stream(chunks(), speaker))
     assert speaker.calls == ["One.", "Two.", "Three."]
     assert result == "One. Two. Three."
+
+
+def test_speak_stream_uses_one_dedicated_thread_for_every_say_call():
+    calling_thread_ids = []
+
+    class _ThreadRecordingSpeaker:
+        def say(self, text):
+            calling_thread_ids.append(threading.get_ident())
+
+    async def chunks():
+        yield "One. "
+        yield "Two. Three."
+
+    asyncio.run(_speak_stream(chunks(), _ThreadRecordingSpeaker()))
+
+    assert len(calling_thread_ids) == 3
+    assert len(set(calling_thread_ids)) == 1
+    assert calling_thread_ids[0] != threading.get_ident()
 
 
 def test_run_text_skips_capture_and_transcription(monkeypatch):

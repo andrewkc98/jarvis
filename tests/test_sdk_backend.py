@@ -80,6 +80,19 @@ def test_ensure_connected_raises_on_failed_mcp_server(monkeypatch, mocked_config
         asyncio.run(backend._ensure_connected())
 
 
+def test_ensure_connected_disconnects_client_when_health_check_fails(monkeypatch, mocked_config):
+    class FailingClient(FakeClient):
+        async def get_mcp_status(self):
+            return {"mcpServers": [{"name": "obsidian", "status": "failed", "error": "boom"}]}
+
+    monkeypatch.setattr(sdk_backend, "ClaudeSDKClient", FailingClient)
+    backend = sdk_backend.SDKBackend()
+    with pytest.raises(sdk_backend.McpServerUnavailableError):
+        asyncio.run(backend._ensure_connected())
+    assert FakeClient.instances[0].disconnect_calls == 1
+    assert backend._client is None
+
+
 def test_ensure_connected_raises_on_needs_auth_mcp_server(monkeypatch, mocked_config):
     class NeedsAuthClient(FakeClient):
         async def get_mcp_status(self):
@@ -89,6 +102,19 @@ def test_ensure_connected_raises_on_needs_auth_mcp_server(monkeypatch, mocked_co
     backend = sdk_backend.SDKBackend()
     with pytest.raises(sdk_backend.McpServerUnavailableError, match="needs-auth"):
         asyncio.run(backend._ensure_connected())
+
+
+def test_ensure_connected_disconnects_client_when_health_check_raises_unexpectedly(monkeypatch, mocked_config):
+    class ExplodingClient(FakeClient):
+        async def get_mcp_status(self):
+            raise RuntimeError("control channel dropped")
+
+    monkeypatch.setattr(sdk_backend, "ClaudeSDKClient", ExplodingClient)
+    backend = sdk_backend.SDKBackend()
+    with pytest.raises(RuntimeError, match="control channel dropped"):
+        asyncio.run(backend._ensure_connected())
+    assert FakeClient.instances[0].disconnect_calls == 1
+    assert backend._client is None
 
 
 def test_close_is_idempotent_and_disconnects_once(mocked_config, mocked_client):

@@ -30,21 +30,30 @@ async def _speak_stream(chunks: AsyncIterator[str], speaker) -> str:
                 received.append(chunk)
                 for sentence in buffer.feed(chunk):
                     await queue.put(sentence)
-            trailing = buffer.flush()
-            if trailing:
-                await queue.put(trailing)
         except BaseException as exc:
             producer_error.append(exc)
         finally:
+            trailing = buffer.flush()
+            if trailing:
+                await queue.put(trailing)
             await queue.put(None)
+
+    loop = asyncio.get_running_loop()
+
+    def consume() -> None:
+        """Runs on one dedicated worker thread for the entire turn: every
+        speaker.say() call, and the native audio stream each one opens and
+        closes, happens on this single thread from the first sentence through
+        the last — not a fresh ambient thread-pool thread per sentence."""
+        while True:
+            sentence = asyncio.run_coroutine_threadsafe(queue.get(), loop).result()
+            if sentence is None:
+                return
+            speaker.say(sentence)
 
     producer_task = asyncio.create_task(produce())
     try:
-        while True:
-            sentence = await queue.get()
-            if sentence is None:
-                break
-            await asyncio.to_thread(speaker.say, sentence)
+        await asyncio.to_thread(consume)
     except BaseException:
         producer_task.cancel()
         raise

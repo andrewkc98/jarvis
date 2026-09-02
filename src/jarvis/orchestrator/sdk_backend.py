@@ -50,7 +50,11 @@ class SDKBackend:
         )
         client = ClaudeSDKClient(options)
         await client.connect()
-        await self._check_mcp_health(client)
+        try:
+            await self._check_mcp_health(client)
+        except BaseException:
+            await client.disconnect()
+            raise
         self._client = client
         return client
 
