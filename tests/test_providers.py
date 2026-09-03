@@ -119,6 +119,7 @@ def test_get_daily_note_uses_configured_rest_url_and_token():
         base_url="https://vault.example:27124",
         headers={"Authorization": "Bearer test-token"},
         verify=True,
+        follow_redirects=True,
     )
     client.get.assert_called_once_with("/periodic/daily/")
     response.raise_for_status.assert_called_once_with()
@@ -142,6 +143,7 @@ def test_get_daily_note_uses_self_signed_default_url_when_unconfigured():
         base_url="https://localhost:27124",
         headers={"Authorization": "Bearer test-token"},
         verify=False,
+        follow_redirects=True,
     )
 
 

@@ -409,10 +409,13 @@ async function submitCmd() {
   const text = STATE.cmdText.trim();
   if (!text || STATE.cmdBusy) return;
   setState({ cmdBusy: true, cmdMsg: null, cmdErr: false, cmdReply: null });
-  // Real dispatches run seconds, not milliseconds — this POST gets a long leash.
+  // A real dispatch can spend up to 30s just waiting on a gated tool's confirmation
+  // (CONFIRMATION_TIMEOUT_SECONDS), on top of the SDK turn itself, on top of full
+  // TTS playback if speak=true — the server doesn't respond until the machine has
+  // finished talking. 90s covers that comfortably without being unbounded.
   const r = await req("/command", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text })
-  }, 15000);
+  }, 90000);
   if (r.down || r.err) {
     setState({ cmdBusy: false, cmdErr: true, cmdMsg: r.err || (r.kind === "timeout" ? "no response" : "refused") });
   } else {

@@ -175,6 +175,25 @@ def test_cors_preflight_when_hud_origin_matches(monkeypatch):
     assert "GET" in response.headers.get("access-control-allow-methods", "")
 
 
+def test_cors_preflight_allows_post_for_command_and_approval_routes(monkeypatch):
+    """The HUD's approve/deny buttons and command box all POST with a JSON body
+    (a non-safelisted Content-Type), which triggers a real browser preflight —
+    unlike the GET-only routes Phase 4 shipped, these must actually allow POST."""
+    monkeypatch.setattr(config, "HUD_ORIGIN", "https://hud.local", raising=True)
+    client = TestClient(build_app())
+    for path in ("/command", "/allow", "/deny"):
+        response = client.options(
+            path,
+            headers={
+                "Origin": "https://hud.local",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Content-Type",
+            },
+        )
+        assert response.status_code == 200, f"{path}: {response.text}"
+        assert "POST" in response.headers.get("access-control-allow-methods", "")
+
+
 def test_launcher_main_calls_uvicorn(monkeypatch):
     called = {}
 

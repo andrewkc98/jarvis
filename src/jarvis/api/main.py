@@ -142,6 +142,7 @@ def build_app() -> FastAPI:
         fastapi_app.add_middleware(
             CORSMiddleware,
             allow_origins=[config.HUD_ORIGIN],
+            allow_methods=["GET", "POST"],
         )
     _register_routes(fastapi_app)
     return fastapi_app

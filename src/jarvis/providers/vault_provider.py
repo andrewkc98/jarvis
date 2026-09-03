@@ -39,10 +39,16 @@ def _fetch_daily_note() -> str:
     # The documented local default uses Obsidian's self-signed HTTPS certificate.
     # Explicitly configured URLs retain normal TLS certificate verification.
     verify = False if using_default else True
+    # The Local REST API 307-redirects /periodic/daily/ to the note's real vault
+    # path once that file exists (it doesn't when there's no note for today yet,
+    # which is why this only ever showed up in live testing). httpx does not
+    # follow redirects by default, unlike requests — without this, raise_for_status()
+    # raises on the un-followed 307 instead of returning the note's actual content.
     with httpx.Client(
         base_url=base_url,
         headers={"Authorization": f"Bearer {token}"},
         verify=verify,
+        follow_redirects=True,
     ) as client:
         response = client.get(_DAILY_NOTE_PATH)
         if response.status_code == 404 and _is_missing_daily_note(response):
