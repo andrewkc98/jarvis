@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JARVIS HUD</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; padding: 0; background: #08090a; overflow: hidden; }
+  * { box-sizing: border-box; }
+  a { color: #4fe0cf; text-decoration: none; }
+  a:hover { color: #7df0e2; }
+  input { font: inherit; color: inherit; background: none; border: none; outline: none; }
+  input::placeholder { color: #39413f; }
+  body { height: 100vh; width: 100vw; overflow: hidden; background: #08090a; color: #c6cbc8;
+    font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 13px; font-weight: 400;
+    display: grid; grid-template-rows: 46px 1fr; letter-spacing: 0.01em; }
+  header { display: flex; align-items: center; gap: 18px; padding: 0 16px; border-bottom: 1px solid #1b1f21;
+    background: #0a0c0d; min-width: 0; overflow: hidden; white-space: nowrap; }
+  main { display: grid; grid-template-columns: minmax(0, 0.8fr) minmax(0, 0.9fr) minmax(0, 2fr); gap: 10px;
+    padding: 10px; min-height: 0; min-width: 0; overflow: hidden; transition: filter .4s ease; }
+  section { border: 1px solid #1b1f21; background: #0b0d0e; }
+  button { font-family: inherit; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<header>
+  <div style="display: flex; align-items: baseline; gap: 10px; flex: none;">
+    <span style="font-size: 15px; font-weight: 700; letter-spacing: 0.22em; color: #e6ebe8;">JARVIS</span>
+    <span style="font-size: 10px; letter-spacing: 0.18em; color: #5d6663; text-transform: uppercase;">local assistant &middot; hud</span>
+  </div>
+  <div id="linkBox" style="display: flex; align-items: center; gap: 8px; padding: 3px 9px; border: 1px solid #1f2427; background: #0d1012; flex: none;">
+    <span id="linkDot" style="width: 6px; height: 6px;"></span>
+    <span id="linkLabel" style="font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase;"></span>
+  </div>
+  <span id="apiLabel" style="font-size: 10px; letter-spacing: 0.1em; color: #4e5754; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;"></span>
+  <div style="flex: 1; min-width: 6px;"></div>
+  <span id="redactedBadge" hidden style="flex: none; font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: #c99a3e; border: 1px solid #4a3a1c; padding: 2px 7px;">redacted &middot; &#8984;&#8679;H</span>
+  <span id="lastOkLabel" style="flex: none; font-size: 10px; letter-spacing: 0.14em; color: #4e5754; text-transform: uppercase;"></span>
+  <span id="pollLabel" style="flex: none; font-size: 10px; letter-spacing: 0.14em; color: #4e5754; text-transform: uppercase;"></span>
+  <span id="clock" style="flex: none; font-size: 13px; font-weight: 500; letter-spacing: 0.08em; color: #aeb5b2;"></span>
+</header>
+
+<main id="main">
+  <div style="display: grid; grid-template-rows: 1fr auto; gap: 10px; min-height: 0;">
+
+    <section style="display: grid; grid-template-rows: auto 1fr; min-height: 0;">
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid #16191b;">
+        <span style="font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; color: #7e8783;">system vitals</span>
+        <span id="vitalsStamp" style="font-size: 9px; letter-spacing: 0.14em; color: #3f4744;"></span>
+      </div>
+      <div id="vitalsList" style="padding: 14px 12px; display: flex; flex-direction: column; justify-content: space-between; gap: 12px; min-height: 0; overflow: hidden;"></div>
+    </section>
+
+    <section>
+      <div style="padding: 8px 12px; border-bottom: 1px solid #16191b;">
+        <span style="font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; color: #7e8783;">audio i/o</span>
+      </div>
+      <div style="padding: 12px;">
+        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px;">
+          <span id="audioDot" style="flex: none;"></span>
+          <span id="audioLabel" style="font-size: 17px; font-weight: 500; letter-spacing: 0.14em; text-transform: uppercase;"></span>
+        </div>
+        <div id="audioStates" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-bottom: 10px;"></div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="flex: none; font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; color: #3f4744;">level</span>
+          <div id="levelBars" style="flex: 1; display: flex; gap: 2px; height: 10px; align-items: center; min-width: 0;"></div>
+          <span id="levelText" style="flex: none; font-size: 9px; letter-spacing: 0.08em; width: 46px; text-align: right;"></span>
+        </div>
+        <div id="audioNote" style="margin-top: 10px; font-size: 9px; letter-spacing: 0.08em; color: #3a4240;"></div>
+      </div>
+    </section>
+  </div>
+
+  <div style="display: grid; grid-template-rows: 1fr auto; gap: 10px; min-height: 0;">
+
+    <section style="display: grid; grid-template-rows: auto 1fr; min-height: 0;">
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #16191b;">
+        <span style="font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; color: #7e8783;">schedule</span>
+        <span id="scheduleCountLabel" style="font-size: 9px; letter-spacing: 0.14em; color: #3f4744; white-space: nowrap;"></span>
+      </div>
+      <div style="min-height: 0; overflow: hidden;">
+        <div id="scheduleRedacted" hidden style="padding: 16px 12px; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #3f4744;">&#9626; redacted</div>
+        <div id="scheduleNotice" hidden style="padding: 14px 12px; display: flex; gap: 10px; align-items: flex-start;">
+          <span style="width: 6px; height: 6px; margin-top: 5px; background: #c99a3e; flex: none;"></span>
+          <div style="display: flex; flex-direction: column; gap: 5px;">
+            <span id="scheduleNoticeTitle" style="font-size: 11px; letter-spacing: 0.08em; color: #d8c191;"></span>
+            <span id="scheduleNoticeBody" style="font-size: 11px; line-height: 1.5; color: #6f7875;"></span>
+            <span id="scheduleNoticeCode" style="font-size: 9px; letter-spacing: 0.1em; color: #3f4744;"></span>
+          </div>
+        </div>
+        <div id="scheduleEmpty" hidden style="padding: 16px 12px; font-size: 11px; color: #565f5c; letter-spacing: 0.06em;">nothing scheduled ahead</div>
+        <div id="eventsList"></div>
+      </div>
+    </section>
+
+    <section>
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid #16191b;">
+        <span style="font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; color: #7e8783;">vault</span>
+        <span id="vaultStamp" style="font-size: 9px; letter-spacing: 0.14em; color: #3f4744;"></span>
+      </div>
+      <div style="padding: 12px;">
+        <div id="vaultRedacted" hidden style="font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #3f4744;">&#9626; redacted</div>
+        <div id="vaultNotice" hidden style="display: flex; gap: 10px; align-items: flex-start;">
+          <span style="width: 6px; height: 6px; margin-top: 5px; background: #c99a3e; flex: none;"></span>
+          <div style="display: flex; flex-direction: column; gap: 5px;">
+            <span id="vaultNoticeTitle" style="font-size: 11px; letter-spacing: 0.08em; color: #d8c191;"></span>
+            <span id="vaultNoticeBody" style="font-size: 11px; line-height: 1.5; color: #6f7875;"></span>
+            <span id="vaultNoticeCode" style="font-size: 9px; letter-spacing: 0.1em; color: #3f4744;"></span>
+          </div>
+        </div>
+        <div id="vaultOk" hidden style="display: flex; flex-direction: column; gap: 10px;">
+          <div style="display: flex; align-items: baseline; gap: 10px;">
+            <span id="taskCount" style="font-size: 26px; font-weight: 500; line-height: 1; color: #d5dbd8;"></span>
+            <span style="font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; color: #6d7673;">open tasks</span>
+          </div>
+          <div style="border-left: 1px solid #232829; padding: 2px 0 2px 10px;">
+            <div style="font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: #4a5250; margin-bottom: 5px;">daily note</div>
+            <div id="excerpt" style="font-size: 11px; line-height: 1.55; text-wrap: pretty; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden;"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <section style="display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden;">
+    <div style="flex: none; display: flex; align-items: center; gap: 14px; padding: 8px 12px; border-bottom: 1px solid #16191b; white-space: nowrap;">
+      <span style="font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; color: #7e8783;">command deck &middot; telemetry</span>
+      <div style="flex: 1;"></div>
+      <span id="telemetryStamp" style="font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: #3f4744;"></span>
+    </div>
+
+    <div id="approvalPanel" hidden style="flex: none; padding: 11px 12px; border-bottom: 1px solid #1b1f21;">
+      <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">
+        <span id="approvalDot" style="width: 7px; height: 7px; flex: none;"></span>
+        <span id="approvalHeaderLabel" style="font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase;">pipeline halted &middot; approval required</span>
+        <div style="flex: 1;"></div>
+        <span id="approvalUnconfirmedNote" hidden style="font-size: 10px; letter-spacing: 0.06em; color: #d8c191;">link lost &mdash; decision not confirmed</span>
+        <span id="approvalElapsed" style="font-size: 10px; letter-spacing: 0.1em; color: #6f7875;"></span>
+      </div>
+      <div id="approvalBody" style="display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: center;">
+        <div style="display: flex; flex-direction: column; gap: 6px; min-width: 0;">
+          <div style="display: flex; align-items: center; gap: 8px; min-width: 0;">
+            <span id="approvalEffect" style="flex: none; padding: 1px 7px; font-size: 9px; letter-spacing: .16em; text-transform: uppercase;"></span>
+            <span id="approvalTool" style="font-size: 13px; color: #d5dbd8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"></span>
+          </div>
+          <span id="approvalArgs" hidden style="font-size: 11px; line-height: 1.5; color: #8d9793; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"></span>
+          <span id="approvalArgsRedacted" hidden style="font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: #3f4744;">&#9626; redacted</span>
+        </div>
+        <div style="display: flex; gap: 8px; flex: none;">
+          <button type="button" id="denyBtn" style="flex: none; padding: 6px 16px; font-size: 11px; letter-spacing: .16em; text-transform: uppercase; color: #d5dbd8; background: #14181a; border: 1px solid #333b3d; transition: background .15s ease;">deny</button>
+          <button type="button" id="approveBtn" style="flex: none; padding: 6px 16px; font-size: 11px; letter-spacing: .16em; text-transform: uppercase; transition: filter .15s ease;"></button>
+        </div>
+      </div>
+      <div id="approvalError" hidden style="margin-top: 8px; font-size: 10px; letter-spacing: 0.06em; color: #e0674f;"></div>
+    </div>
+
+    <div id="schemaWarn" hidden style="flex: none; display: flex; align-items: center; gap: 9px; padding: 7px 12px; border-bottom: 1px solid #16191b; background: rgba(201,154,62,0.06);">
+      <span style="width: 5px; height: 5px; background: #c99a3e; flex: none;"></span>
+      <span id="schemaWarnText" style="font-size: 10px; letter-spacing: 0.06em; color: #d8c191;"></span>
+    </div>
+
+    <div id="tableHead" style="flex: none; display: grid; align-items: center; column-gap: 10px; padding: 6px 12px; border-bottom: 1px solid #16191b; background: #0d0f10; font-size: 9px; letter-spacing: .16em; text-transform: uppercase; color: #4a5250; white-space: nowrap;">
+      <span>time</span>
+      <span>path</span>
+      <span style="text-align: right;">total</span>
+      <span class="timing-col" style="text-align: right;">stt</span>
+      <span class="timing-col" style="text-align: right;">disp</span>
+      <span class="timing-col" style="text-align: right;">tts</span>
+      <span style="padding-left: 12px; min-width: 0;">tools fired</span>
+      <span style="text-align: right;">status</span>
+    </div>
+
+    <div id="listWrap" style="flex: 1 1 auto; min-height: 0; overflow: hidden;">
+      <div id="telemetryEmpty" hidden style="height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
+        <span style="font-size: 12px; letter-spacing: 0.2em; text-transform: uppercase; color: #5b6461;">no activity yet</span>
+        <span style="font-size: 10px; letter-spacing: 0.06em; color: #3a4240;">rows appear here after the first turn</span>
+      </div>
+      <div id="telemetryNotice" hidden style="padding: 14px 12px; display: flex; gap: 10px; align-items: flex-start;">
+        <span style="width: 6px; height: 6px; margin-top: 5px; background: #c99a3e; flex: none;"></span>
+        <div style="display: flex; flex-direction: column; gap: 5px;">
+          <span style="font-size: 11px; letter-spacing: 0.08em; color: #d8c191;">Telemetry feed unavailable</span>
+          <span id="telemetryNoticeText" style="font-size: 11px; color: #6f7875;"></span>
+        </div>
+      </div>
+      <div id="turnsList"></div>
+    </div>
+
+    <div style="flex: none; display: flex; align-items: center; gap: 14px; padding: 7px 12px; border-top: 1px solid #16191b; background: #0d0f10; font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: #4a5250; min-width: 0; overflow: hidden; white-space: nowrap;">
+      <span id="statTurns" style="flex: none;"></span>
+      <span id="statSplit" style="flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;"></span>
+      <span id="statP50" style="flex: none;"></span>
+      <span id="statErrors" style="flex: none;"></span>
+      <div style="flex: 1; min-width: 8px;"></div>
+      <span id="statWindow" style="flex: none;"></span>
+    </div>
+
+    <div id="cmdReplyBar" hidden style="flex: none; display: flex; align-items: center; gap: 9px; padding: 6px 12px; border-top: 1px solid #16191b; background: #0b0e0f; min-width: 0; white-space: nowrap;">
+      <span id="cmdReplyTag" style="flex: none; font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: #3f4744;"></span>
+      <span id="cmdReply" style="flex: 1; min-width: 0; font-size: 11px; color: #9fa8a4; overflow: hidden; text-overflow: ellipsis;"></span>
+    </div>
+
+    <div style="flex: none; display: flex; align-items: center; gap: 9px; padding: 8px 12px; border-top: 1px solid #1b1f21; background: #090b0c; min-width: 0;">
+      <span style="flex: none; font-size: 13px; color: #4fe0cf;">&#8250;</span>
+      <input type="text" id="cmdInput" spellcheck="false" style="flex: 1; min-width: 0; font-size: 12px; color: #d5dbd8; letter-spacing: 0.02em; caret-color: #4fe0cf;" />
+      <span id="cmdHint" style="flex: none; font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase;"></span>
+    </div>
+  </section>
+</main>
+
+<script>
+/*
+ * JARVIS HUD — standalone build.
+ *
+ * Converted from a Claude Design canvas export (JARVIS HUD.dc.html + support.js),
+ * which requires Claude Design's own hosting runtime and does not render as a plain
+ * static file. This file has no external runtime dependency beyond the Google Font
+ * link above — open it directly in a browser, or serve it with any static file
+ * server (`python3 -m http.server` from this directory, or the project's
+ * `.claude/launch.json` "hud-static" config).
+ *
+ * Architecture mirrors the original design intentionally: CONFIG (was `props`),
+ * STATE (was React-like `state`), computeVals() (was `renderVals()` — pure
+ * presentation-value computation, unchanged in substance) and render(vals) (new —
+ * applies computed values to the real DOM, replacing the original's `{{ }}` bindings
+ * and `<sc-if>`/`<sc-for>` directives).
+ *
+ * KNOWN GAP: /pending-approval, /allow, /deny, and /command are not yet implemented
+ * by the real Jarvis backend (as of this writing, only /vitals, /schedule,
+ * /vault-summary, /telemetry are planned/real). The approval panel and command input
+ * below are fully wired and will work the moment those endpoints exist; until then
+ * they simply never activate (pollApproval() finds nothing pending, submitCmd() will
+ * report a connection/404 failure if used). See .agent/PLAN.md for that work.
+ */
+
+// ---------- Configuration — edit these directly, no build step needed ----------
+const CONFIG = {
+  apiBase: "http://127.0.0.1:8765",
+  pollMs: 4000,
+  approvalPollMs: 1000,
+  telemetryLimit: 20,
+  latencyBudgetMs: 2000,
+  mockScenario: "healthy", // healthy | degraded | empty | errors | approval · write | approval · exec | in flight | schema drift
+  pttBinding: "fn",
+  audioState: "idle", // idle | listening | processing | speaking — overridden by a "jarvis-audio" CustomEvent if dispatched
+  showTiming: true
+};
+
+// ---------- Static data (verbatim from the original design) ----------
+const KNOWN_SCHEMA = 1;
+
+const EFFECT = {
+  read:  { style: "background:#121617;border:1px solid #1e2325;color:#8d9793;", accent: "#8d9793" },
+  write: { style: "background:rgba(201,154,62,0.09);border:1px solid #5f4a1e;color:#d8a94a;", accent: "#c99a3e" },
+  exec:  { style: "background:rgba(224,103,79,0.11);border:1px solid #6f3527;color:#ec8f6c;", accent: "#e0674f" }
+};
+
+const MOCK_TELEMETRY = [
+  { schema_version: 1, offset: 18, path: "sdk", duration_ms: 1840.2, stt_ms: 620.5, dispatch_ms: 1190.1, tts_first_ms: 410.2, tools_fired: [{ name: "mcp__obsidian__vault_read", effect: "read" }], error: null },
+  { schema_version: 1, offset: 96, path: "schedule", duration_ms: 42.0, stt_ms: null, dispatch_ms: 40.1, tts_first_ms: 180.4, tools_fired: [], error: null },
+  { schema_version: 1, offset: 240, path: "sdk", duration_ms: 3120.7, stt_ms: 710.2, dispatch_ms: 2380.4, tts_first_ms: 520.9, tools_fired: [{ name: "mcp__obsidian__vault_write", effect: "write" }, { name: "mcp__calendar__list_events", effect: "read" }], error: null },
+  { schema_version: 1, offset: 415, path: "sdk", duration_ms: 980.4, stt_ms: 540.0, dispatch_ms: 430.2, tts_first_ms: null, tools_fired: [], error: "PermissionError" },
+  { schema_version: 1, offset: 610, path: "schedule", duration_ms: 38.6, stt_ms: null, dispatch_ms: 36.9, tts_first_ms: 165.1, tools_fired: [], error: null },
+  { schema_version: 1, offset: 902, path: "sdk", duration_ms: 2240.9, stt_ms: 655.1, dispatch_ms: 1580.3, tts_first_ms: 445.6, tools_fired: [{ name: "mcp__obsidian__vault_search", effect: "read" }], error: null },
+  { schema_version: 1, offset: 1180, path: "schedule", duration_ms: 51.3, stt_ms: null, dispatch_ms: 48.8, tts_first_ms: 190.0, tools_fired: [], error: null },
+  { schema_version: 1, offset: 1495, path: "sdk", duration_ms: 4310.5, stt_ms: 890.4, dispatch_ms: 3400.6, tts_first_ms: 690.3, tools_fired: [{ name: "mcp__shell__run", effect: "exec" }, { name: "mcp__obsidian__vault_read", effect: "read" }], error: null },
+  { schema_version: 1, offset: 1830, path: "schedule", duration_ms: 44.7, stt_ms: null, dispatch_ms: 42.2, tts_first_ms: 172.8, tools_fired: [], error: null },
+  { schema_version: 1, offset: 2210, path: "sdk", duration_ms: 1620.0, stt_ms: 600.7, dispatch_ms: 1010.9, tts_first_ms: null, tools_fired: [], error: "TimeoutError" },
+  { schema_version: 1, offset: 2640, path: "sdk", duration_ms: 2010.3, stt_ms: null, dispatch_ms: 1350.1, tts_first_ms: 430.5, tools_fired: [{ name: "mcp__calendar__create_event", effect: "write" }], error: null },
+  { schema_version: 1, offset: 3050, path: "schedule", duration_ms: 39.8, stt_ms: null, dispatch_ms: 37.4, tts_first_ms: 168.2, tools_fired: [], error: null },
+  { schema_version: 1, offset: 3520, path: "sdk", duration_ms: 1290.6, stt_ms: 580.2, dispatch_ms: 700.1, tts_first_ms: 395.4, tools_fired: ["mcp__obsidian__vault_read"], error: null },
+  { schema_version: 1, offset: 4010, path: "schedule", duration_ms: 47.1, stt_ms: null, dispatch_ms: 44.0, tts_first_ms: 175.9, tools_fired: [], error: null },
+  { schema_version: 1, offset: 4600, path: "sdk", duration_ms: 2870.4, stt_ms: 702.3, dispatch_ms: 2110.8, tts_first_ms: 505.1, tools_fired: [{ name: "mcp__obsidian__vault_write", effect: "write" }], error: null }
+];
+
+const MOCK_EVENTS = [
+  { summary: "Team sync", offsetMin: 26, durMin: 30 },
+  { summary: "1:1 — Priya", offsetMin: 95, durMin: 25 },
+  { summary: "Design review: HUD v2", offsetMin: 180, durMin: 45 },
+  { summary: "Deploy window (staging)", offsetMin: 320, durMin: 60 },
+  { summary: "Retro", offsetMin: 400, durMin: 30 },
+  { summary: "Oncall handoff", offsetMin: 470, durMin: 15 }
+];
+
+const AUDIO = {
+  idle:       { label: "idle",       short: "idle",   color: "#6d7673", glow: "rgba(120,132,128,0.35)" },
+  listening:  { label: "listening",  short: "listen", color: "#4fe0cf", glow: "rgba(79,224,207,0.55)" },
+  processing: { label: "processing", short: "proc",   color: "#c99a3e", glow: "rgba(201,154,62,0.5)" },
+  speaking:   { label: "speaking",   short: "speak",  color: "#7cc4f0", glow: "rgba(124,196,240,0.5)" }
+};
+
+const NOTICES = {
+  calendar_permission_required: {
+    title: "Calendar access not granted",
+    body: "Grant JARVIS access to Calendars in System Settings › Privacy & Security, then this panel fills in on the next poll."
+  },
+  calendar_unavailable: {
+    title: "Calendar service not responding",
+    body: "The local calendar bridge is offline. Schedule data will return automatically once it answers."
+  },
+  link_down: {
+    title: "No answer from the assistant",
+    body: "This endpoint did not respond, so the HUD cannot tell whether the calendar itself is healthy. Check that the backend is running."
+  }
+};
+
+const EVENT_CAP = 4;
+
+// ---------- Mutable state (was the original's React-like `this.state`) ----------
+const STATE = {
+  rowCap: 9, narrow: false, now: Date.now(),
+  everOk: false, lastOk: null, downKind: null,
+  vitals: null, schedule: null, scheduleErr: null,
+  vault: null, vaultErr: null, telemetry: null, telemetryErr: null,
+  approval: null, approvalErr: null, approvalBusy: false, approvalUnconfirmed: false,
+  audio: null, level: null,
+  cmdText: "", cmdBusy: false, cmdMsg: null, cmdErr: false, cmdReply: null, cmdTurnId: null,
+  redacted: false
+};
+
+function setState(patch) { Object.assign(STATE, patch); scheduleRender(); }
+
+// ---------- Networking (verbatim logic from the original) ----------
+function base() { return (CONFIG.apiBase || "http://127.0.0.1:8765").replace(/\/$/, ""); }
+function pollMs() { return Math.max(1000, CONFIG.pollMs || 4000); }
+function budget() { return Math.max(100, CONFIG.latencyBudgetMs || 2000); }
+
+async function req(path, init, timeoutMs) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs || 1500);
+  try {
+    const res = await fetch(base() + path, Object.assign({ signal: ctl.signal }, init || {}));
+    let body = null;
+    if (res.status !== 204) { try { body = await res.json(); } catch (e) { body = null; } }
+    if (!res.ok) return { err: (body && body.error) || "http_" + res.status, status: res.status };
+    return { data: body, status: res.status };
+  } catch (e) {
+    // AbortError = server accepted the socket but never answered in time.
+    // TypeError = connection refused / no listener on the port.
+    return { down: true, kind: e && e.name === "AbortError" ? "timeout" : "refused" };
+  } finally { clearTimeout(t); }
+}
+
+async function poll() {
+  const limit = CONFIG.telemetryLimit || 20;
+  const [v, s, va, te] = await Promise.all([
+    req("/vitals"), req("/schedule"), req("/vault-summary"), req("/telemetry?limit=" + limit)
+  ]);
+  if (v.down && s.down && va.down && te.down) { setState({ downKind: v.kind }); return; }
+  // A `down` endpoint is a transport failure, not a subsystem verdict — never
+  // attribute it to calendar/obsidian, which have their own 502/503 codes.
+  setState({
+    everOk: true, lastOk: Date.now(), downKind: null,
+    vitals: v.data || STATE.vitals,
+    schedule: s.data || (s.err ? null : STATE.schedule),
+    scheduleErr: s.err || (s.down ? "link_down" : null),
+    vault: va.data || (va.err ? null : STATE.vault),
+    vaultErr: va.err || (va.down ? "link_down" : null),
+    telemetry: te.data || STATE.telemetry,
+    telemetryErr: te.err || (te.down ? "unreachable" : null)
+  });
+}
+
+async function pollApproval() {
+  const r = await req("/pending-approval");
+  // A failed poll never clears a pending decision — the backend is still
+  // blocked on it. Keep it on screen, flagged unconfirmed.
+  if (r.down || r.err) { if (STATE.approval && !STATE.approvalUnconfirmed) setState({ approvalUnconfirmed: true }); return; }
+  const d = r.data;
+  const pending = d && d.id ? d : null;
+  if (JSON.stringify(pending) !== JSON.stringify(STATE.approval) || STATE.approvalUnconfirmed) {
+    setState({ approval: pending, approvalUnconfirmed: false, approvalErr: null });
+  }
+}
+
+async function decide(verb) {
+  const a = STATE.approval || mock().approval;
+  if (!a) return;
+  setState({ approvalBusy: true, approvalErr: null });
+  const r = await req("/" + verb, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: a.id })
+  }, 5000);
+  if (r.down || r.err) {
+    setState({ approvalBusy: false, approvalErr: r.err || (r.kind === "timeout" ? "no response from /" + verb : "/" + verb + " refused the connection") });
+  } else {
+    setState({ approvalBusy: false, approval: null, approvalErr: null });
+    poll();
+  }
+}
+
+async function submitCmd() {
+  const text = STATE.cmdText.trim();
+  if (!text || STATE.cmdBusy) return;
+  setState({ cmdBusy: true, cmdMsg: null, cmdErr: false, cmdReply: null });
+  // Real dispatches run seconds, not milliseconds — this POST gets a long leash.
+  const r = await req("/command", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text })
+  }, 15000);
+  if (r.down || r.err) {
+    setState({ cmdBusy: false, cmdErr: true, cmdMsg: r.err || (r.kind === "timeout" ? "no response" : "refused") });
+  } else {
+    const d = r.data || {};
+    setState({
+      cmdText: "", cmdBusy: false, cmdErr: false,
+      cmdTurnId: d.turn_id || null,
+      cmdReply: d.reply || null,
+      cmdMsg: d.reply ? "replied" : "running"
+    });
+    poll();
+  }
+}
+
+function linkState() {
+  if (!STATE.everOk) return "mock";
+  return STATE.downKind ? "stale" : "live";
+}
+
+function scenario() { return CONFIG.mockScenario || "healthy"; }
+
+// Mock data is pinned to a single epoch captured at load, so sample rows age and
+// sample events count down exactly like real ones. Never derive it from STATE.now
+// — that ticks every second and would freeze all relative times.
+const mockEpoch = Date.now();
+let mockCache = null, mockKey = null;
+
+function mock() {
+  const sc = scenario();
+  if (mockKey === sc && mockCache) return mockCache;
+  const now = mockEpoch;
+  const vitals = sc === "degraded"
+    ? { cpu_percent: 87.4, ram_percent: 92.1, disk_percent: 71.3, gpu: "unavailable", cpu_cores: 10, ram_total_gb: 32 }
+    : { cpu_percent: 34.2, ram_percent: 61.0, disk_percent: 48.5, gpu: "unavailable", cpu_cores: 10, ram_total_gb: 32 };
+  let schedule = { events: MOCK_EVENTS.map(e => ({
+    summary: e.summary,
+    start: new Date(now + e.offsetMin * 60000).toISOString(),
+    end: new Date(now + (e.offsetMin + e.durMin) * 60000).toISOString()
+  })) };
+  let scheduleErr = null, vaultErr = null, approval = null;
+  let vault = { daily_note_excerpt: "Shipped the telemetry ring buffer. Next: wire the schedule fast-path so calendar questions never touch the model.\n\nOpen thread: TTS latency spikes after long dispatches.", open_task_count: 3 };
+  let entries = MOCK_TELEMETRY.map(e => ({ ...e, timestamp: new Date(now - e.offset * 1000).toISOString() }));
+
+  if (sc === "empty") { entries = []; schedule = { events: [] }; vault = { daily_note_excerpt: "", open_task_count: 0 }; }
+  if (sc === "degraded") { scheduleErr = "calendar_permission_required"; vaultErr = "obsidian_unavailable"; entries = entries.slice(0, 6); }
+  if (sc === "errors") entries = entries.map((e, i) => i % 3 === 0 ? { ...e, error: ["PermissionError", "TimeoutError", "ConnectionResetError"][i % 3] } : e);
+  if (sc === "approval · write") approval = { id: "ap_7f31", tool: "mcp__obsidian__vault_write", effect: "write", args_preview: "Daily/2026-09-02.md — append 3 lines", requested_at: new Date(now - 6400).toISOString() };
+  if (sc === "approval · exec") approval = { id: "ap_9c02", tool: "mcp__shell__run", effect: "exec", args_preview: "rsync -a ~/vault/ /Volumes/backup/vault/ --delete", requested_at: new Date(now - 2100).toISOString() };
+  if (sc === "in flight") entries = [{ schema_version: 1, timestamp: new Date(now - 3400).toISOString(), path: "sdk", in_flight: true, duration_ms: null, stt_ms: 640.2, dispatch_ms: null, tts_first_ms: null, tools_fired: [{ name: "mcp__obsidian__vault_search", effect: "read" }], error: null }].concat(entries);
+  if (sc === "schema drift") entries = entries.map((e, i) => i < 3 ? { ...e, schema_version: 2 } : e);
+  mockKey = sc;
+  mockCache = { vitals, schedule, scheduleErr, vault, vaultErr, entries, approval };
+  return mockCache;
+}
+
+// ---------- Formatting helpers (verbatim) ----------
+function fmtDur(ms) {
+  if (ms == null) return "—";
+  if (ms < 1000) return Math.round(ms) + "ms";
+  return (ms / 1000).toFixed(2) + "s";
+}
+function fmtClock(d) {
+  const p = (n) => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+function fmtAge(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60);
+  return m < 60 ? m + "m " + (s % 60) + "s" : Math.floor(m / 60) + "h " + (m % 60) + "m";
+}
+function budgetColor(ms) {
+  if (ms == null) return "#c6cbc8";
+  const r = ms / budget();
+  return r > 1.5 ? "#e0674f" : r >= 1.0 ? "#c99a3e" : "#c6cbc8";
+}
+
+// ---------- Pure presentation computation (was `renderVals()`, unchanged in substance) ----------
+function computeVals() {
+  const st = STATE, now = st.now;
+  const link = linkState();
+  const usingMock = link === "mock";
+  const m = mock();
+  const showTiming = CONFIG.showTiming !== false && !st.narrow;
+  const redacted = st.redacted;
+
+  const vitalsData = usingMock ? m.vitals : st.vitals;
+  const scheduleData = usingMock ? m.schedule : st.schedule;
+  const scheduleErr = usingMock ? m.scheduleErr : st.scheduleErr;
+  const vaultData = usingMock ? m.vault : st.vault;
+  const vaultErr = usingMock ? m.vaultErr : st.vaultErr;
+  const telErr = usingMock ? null : st.telemetryErr;
+  const rawEntries = usingMock ? m.entries : ((st.telemetry && st.telemetry.entries) || []);
+  const approval = usingMock ? m.approval : st.approval;
+
+  // ---- vitals ----
+  const bar = (label, pct, sub) => {
+    const p = Math.max(0, Math.min(100, pct == null ? 0 : pct));
+    const hot = p >= 85, warm = p >= 70;
+    const col = hot ? "#e0674f" : warm ? "#c99a3e" : "#4fe0cf";
+    return {
+      label, sub: sub || "", subRight: pct == null ? "NO DATA" : hot ? "SATURATED" : warm ? "ELEVATED" : "NOMINAL",
+      value: pct == null ? "—" : p.toFixed(1) + "%",
+      labelColor: "#8d9793", valueColor: hot ? "#e0674f" : "#d5dbd8",
+      trackStyle: "position:relative;height:8px;background:#131718;border:1px solid #1e2325;overflow:hidden;",
+      fillStyle: "height:100%;width:" + p + "%;background:" + col + ";box-shadow:0 0 10px " + col + "66;transition:width .5s ease;"
+    };
+  };
+  const cores = vitalsData && vitalsData.cpu_cores;
+  const ramGb = vitalsData && vitalsData.ram_total_gb;
+  const gpuState = (vitalsData && vitalsData.gpu) || "unavailable";
+  const gpuOn = gpuState !== "unavailable" && gpuState !== "unsupported";
+  const vitals = [
+    bar("cpu", vitalsData && vitalsData.cpu_percent, typeof cores === "number" ? cores + " cores" : ""),
+    bar("ram", vitalsData && vitalsData.ram_percent, typeof ramGb === "number" ? (Math.round(ramGb * 10) / 10) + " gb" : ""),
+    bar("disk", vitalsData && vitalsData.disk_percent, ""),
+    gpuOn ? bar("gpu", vitalsData && vitalsData.gpu_percent, String(gpuState)) : {
+      label: "gpu", sub: "not exposed", subRight: "EXPECTED",
+      value: "unavailable", labelColor: "#4a5250", valueColor: "#4a5250",
+      trackStyle: "position:relative;height:8px;background:repeating-linear-gradient(135deg,#121516 0 5px,#0d0f10 5px 10px);border:1px dashed #222829;",
+      fillStyle: "height:100%;width:0%;"
+    }
+  ];
+
+  // ---- schedule ----
+  const notice = scheduleErr ? (NOTICES[scheduleErr] || { title: "Schedule unavailable", body: "The schedule endpoint did not answer. Retrying on each poll." }) : null;
+  const rawEvents = (scheduleData && scheduleData.events) || [];
+  const events = redacted || notice ? [] : rawEvents.slice(0, EVENT_CAP).map(e => {
+    const s = new Date(e.start), en = e.end ? new Date(e.end) : null;
+    const mins = Math.round((s - now) / 60000);
+    const soon = mins <= 15 && mins >= -5;
+    let rel;
+    if (mins < -1) rel = "in progress";
+    else if (mins <= 0) rel = "now";
+    else if (mins < 60) rel = "in " + mins + "m";
+    else rel = "in " + Math.floor(mins / 60) + "h " + (mins % 60) + "m";
+    const p = (n) => String(n).padStart(2, "0");
+    return {
+      time: p(s.getHours()) + ":" + p(s.getMinutes()),
+      dur: en ? Math.round((en - s) / 60000) + " min" : "",
+      summary: e.summary || "(untitled)",
+      rel, relColor: soon ? "#4fe0cf" : "#5d6663",
+      timeColor: soon ? "#4fe0cf" : "#aeb5b2"
+    };
+  });
+  const shownEvents = Math.min(rawEvents.length, EVENT_CAP);
+  const scheduleCountLabel = redacted ? "hidden"
+    : notice ? "unavailable"
+    : rawEvents.length > shownEvents ? "showing " + shownEvents + " of " + rawEvents.length
+    : rawEvents.length + " upcoming";
+
+  // ---- vault ----
+  const excerptRaw = vaultData && vaultData.daily_note_excerpt;
+  const hasExcerpt = !!(excerptRaw && excerptRaw.trim());
+
+  // ---- telemetry ----
+  // ASSUMPTION: /telemetry returns entries newest-first. The HUD does not re-sort
+  // by timestamp; it only floats in_flight rows to the top. If the backend ever
+  // changes that ordering, this display is wrong.
+  const entries = rawEntries.slice().sort((a, b) => (b.in_flight ? 1 : 0) - (a.in_flight ? 1 : 0));
+  const gridCols = showTiming
+    ? "68px 74px 62px 56px 62px 56px minmax(0,1fr) minmax(78px,max-content)"
+    : "68px 74px 62px minmax(0,1fr) minmax(78px,max-content)";
+  const maxSchema = entries.reduce((n, e) => Math.max(n, e.schema_version || 1), 1);
+  const turns = entries.slice(0, st.rowCap).map(e => {
+    const d = new Date(e.timestamp);
+    const inFlight = !!e.in_flight;
+    const failed = !inFlight && !!e.error;
+    const sdk = e.path === "sdk";
+    const elapsed = inFlight ? now - d.getTime() : null;
+    const tools = (e.tools_fired || []).map(t => typeof t === "string" ? { name: t, effect: "read" } : { name: t.name, effect: EFFECT[t.effect] ? t.effect : "read" });
+    const shown = tools.slice(0, st.narrow ? 1 : 2);
+    return {
+      time: fmtClock(d),
+      timeColor: inFlight ? "#c99a3e" : "#7b8481",
+      path: e.path,
+      pathStyle: "display:inline-block;padding:1px 7px;font-size:10px;letter-spacing:.14em;text-transform:uppercase;border:1px solid " +
+        (sdk ? "#2c4c55;color:#7cc4f0;background:rgba(124,196,240,0.07)" : "#2b4a44;color:#4fe0cf;background:rgba(79,224,207,0.07)") + ";",
+      dur: inFlight ? fmtDur(elapsed) : fmtDur(e.duration_ms),
+      durColor: inFlight ? "#d8a94a" : budgetColor(e.duration_ms),
+      stt: fmtDur(e.stt_ms),
+      dispatch: fmtDur(e.dispatch_ms),
+      tts: fmtDur(e.tts_first_ms),
+      tools: shown.map(t => ({
+        full: t.name + " · " + t.effect,
+        name: t.name.split("__").pop(),
+        style: "flex:0 1 auto;min-width:0;font-size:10px;padding:1px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" + EFFECT[t.effect].style
+      })),
+      moreTools: tools.length > shown.length,
+      moreLabel: "+" + (tools.length - shown.length),
+      noTools: tools.length === 0,
+      status: inFlight ? "in flight" : failed ? e.error : "ok",
+      statusColor: inFlight ? "#d8a94a" : failed ? "#e0674f" : "#48514e",
+      rowStyle: "display:grid;grid-template-columns:" + gridCols + ";align-items:center;column-gap:10px;padding:7px 12px;border-bottom:1px solid #121516;" +
+        (failed ? "background:linear-gradient(90deg,rgba(224,103,79,0.09),transparent 55%);box-shadow:inset 2px 0 0 #e0674f;"
+                : inFlight ? "background:rgba(201,154,62,0.06);box-shadow:inset 2px 0 0 #c99a3e;" : "")
+    };
+  });
+
+  const durs = entries.filter(e => !e.in_flight).map(e => e.duration_ms).filter(n => typeof n === "number").sort((a, b) => a - b);
+  const p50 = durs.length ? durs[Math.floor(durs.length / 2)] : null;
+  const sdkN = entries.filter(e => e.path === "sdk").length;
+  const errN = entries.filter(e => e.error).length;
+
+  // ---- audio + level meter ----
+  const aKey = st.audio || CONFIG.audioState || "idle";
+  const a = AUDIO[aKey] || AUDIO.idle;
+  const lvl = st.level;
+  const hasLvl = typeof lvl === "number";
+  const SEG = 26;
+  const litN = hasLvl ? Math.round(lvl * SEG) : 0;
+  const levelBars = Array.from({ length: SEG }, (_, i) => {
+    const lit = hasLvl && i < litN;
+    const near = i / SEG;
+    const col = near > 0.86 ? "#e0674f" : near > 0.68 ? "#c99a3e" : a.color;
+    return { style: "flex:1;min-width:0;height:" + (lit ? 10 : 3) + "px;background:" + (lit ? col : "#1b2124") + ";" };
+  });
+  const binding = CONFIG.pttBinding || "fn";
+  const NOTES = {
+    idle: "push-to-talk · hold " + binding,
+    listening: "capturing input · stt streaming",
+    processing: "dispatching turn · awaiting response",
+    speaking: "tts playback active"
+  };
+
+  const diag = st.downKind === "timeout"
+    ? "Connection accepted but no response within 1.5s (timeout) — backend is up but wedged."
+    : st.downKind === "refused"
+    ? "Connection refused — nothing is listening on " + base() + "."
+    : link === "live" ? "All endpoints responding." : "No successful poll yet — showing sample data, not host data.";
+
+  return {
+    clock: fmtClock(new Date(now)),
+    redacted,
+    linkLabel: link === "live" ? "live" : link === "mock" ? "mock data" : "stale " + fmtAge(now - (st.lastOk || now)),
+    linkDotColor: link === "live" ? "#4fe0cf" : "#c99a3e",
+    linkTextColor: link === "live" ? "#8d9793" : "#d8c191",
+    linkDiagnosis: diag,
+    lastOkLabel: st.lastOk ? "last ok " + fmtAge(now - st.lastOk) + " ago" : "never polled",
+    apiLabel: base() + (st.downKind ? " · " + st.downKind : ""),
+    pollLabel: (pollMs() / 1000).toFixed(0) + "s",
+
+    vitals,
+    vitalsStamp: usingMock ? "sample" : link === "stale" ? "last known" : "host",
+
+    events,
+    scheduleEmpty: !redacted && !notice && rawEvents.length === 0,
+    scheduleNotice: !redacted && !!notice,
+    scheduleNoticeTitle: notice ? notice.title : "",
+    scheduleNoticeBody: notice ? notice.body : "",
+    scheduleNoticeCode: scheduleErr || "",
+    scheduleCountLabel,
+    scheduleRedacted: redacted,
+
+    vaultOk: !redacted && !vaultErr,
+    vaultNotice: !redacted && !!vaultErr,
+    vaultRedacted: redacted,
+    vaultNoticeTitle: vaultErr === "link_down" ? "No answer from the assistant" : "Obsidian not reachable",
+    vaultNoticeBody: vaultErr === "link_down"
+      ? "This endpoint did not respond, so the HUD cannot tell whether the vault itself is healthy. Check that the backend is running."
+      : "Vault data is unavailable until the local Obsidian bridge responds. Retrying on each poll.",
+    vaultNoticeCode: vaultErr || "",
+    vaultStamp: redacted ? "hidden" : vaultErr ? "unavailable" : link === "stale" ? "last known" : "synced",
+    taskCount: vaultData ? String(vaultData.open_task_count ?? 0) : "0",
+    excerpt: hasExcerpt ? excerptRaw.trim() : "no daily note for today yet — it will appear once created",
+    excerptColor: hasExcerpt ? "#98a09d" : "#4a5250",
+
+    showTiming,
+    gridCols,
+    turns,
+    telemetryEmpty: !telErr && turns.length === 0,
+    telemetryNotice: !!telErr && turns.length === 0,
+    telemetryNoticeText: link === "stale" ? "Showing the last rows received before the link dropped." : "Retrying on each poll.",
+    telemetryStamp: usingMock ? "sample" : link === "stale" ? "frozen" : "streaming",
+    statTurns: entries.length + " turns",
+    statSplit: sdkN + " sdk · " + (entries.length - sdkN) + " schedule",
+    statP50: "p50 " + fmtDur(p50) + " / " + (budget() / 1000).toFixed(2) + "s",
+    statP50Color: budgetColor(p50) === "#c6cbc8" ? "#4a5250" : budgetColor(p50),
+    statErrors: errN + " failed",
+    statErrColor: errN ? "#e0674f" : "#4a5250",
+    statWindow: "showing " + turns.length + " of " + entries.length,
+
+    schemaWarn: maxSchema > KNOWN_SCHEMA,
+    schemaWarnText: "telemetry schema v" + maxSchema + " — HUD expects v" + KNOWN_SCHEMA + ", some columns may be blank",
+
+    approvalPending: !!approval,
+    approvalTool: approval ? approval.tool : "",
+    approvalEffect: approval ? (EFFECT[approval.effect] ? approval.effect : "read") : "",
+    approvalEffectStyle: approval ? "flex:none;padding:1px 7px;font-size:9px;letter-spacing:.16em;text-transform:uppercase;" + (EFFECT[approval.effect] || EFFECT.read).style : "",
+    approvalArgsVisible: !!approval && !redacted,
+    approvalArgsRedacted: !!approval && redacted,
+    approvalArgs: approval && !redacted ? (approval.args_preview || "") : "",
+    approvalElapsed: approval ? fmtAge(now - new Date(approval.requested_at).getTime()) : "",
+    approvalUnconfirmed: !!approval && !!st.approvalUnconfirmed,
+    approvalLocked: !!st.approvalUnconfirmed || !!st.approvalBusy,
+    approvalBodyFilter: st.approvalUnconfirmed ? "filter:saturate(0.3) opacity(0.7);" : "",
+    approvalAccent: approval ? (EFFECT[approval.effect] || EFFECT.read).accent : "#c99a3e",
+    approvalWrapBg: approval && approval.effect === "exec" ? "rgba(224,103,79,0.07)" : "rgba(201,154,62,0.06)",
+    denyDisabledStyle: st.approvalUnconfirmed || st.approvalBusy ? "cursor:not-allowed;opacity:0.45;" : "cursor:pointer;",
+    approveStyle: "flex:none;padding:6px 16px;font-size:11px;letter-spacing:.16em;text-transform:uppercase;transition:filter .15s ease;" +
+      (st.approvalUnconfirmed || st.approvalBusy ? "cursor:not-allowed;opacity:0.45;" : "cursor:pointer;") +
+      (approval && approval.effect === "exec"
+        ? "color:#0b0d0e;background:#e0674f;border:1px solid #e0674f;font-weight:700;"
+        : "color:#d8a94a;background:rgba(201,154,62,0.10);border:1px solid #6f5622;"),
+    approveLabel: st.approvalBusy ? "sending…" : approval && approval.effect === "exec" ? "approve exec" : "approve",
+    approvalError: !!st.approvalErr,
+    approvalErrorText: st.approvalErr ? "could not reach the backend — " + st.approvalErr : "",
+
+    cmdText: st.cmdText,
+    cmdBusy: st.cmdBusy,
+    cmdPlaceholder: st.cmdBusy ? "dispatching…" : "type a command · runs the same pipeline, stt skipped",
+    cmdHint: st.cmdMsg ? st.cmdMsg : st.cmdText.trim() ? "↵ send" : "text path",
+    cmdHintColor: st.cmdErr ? "#e0674f" : st.cmdMsg ? "#4fe0cf" : "#3f4744",
+    cmdReplyVisible: !!st.cmdReply,
+    cmdReply: st.cmdReply || "",
+    cmdReplyTag: st.cmdTurnId ? "turn " + st.cmdTurnId : "reply",
+
+    audioLabel: a.label,
+    audioColor: a.color,
+    audioNote: NOTES[aKey] || NOTES.idle,
+    audioDotStyle: "width:12px;height:12px;flex:none;background:" + a.color + ";box-shadow:0 0 14px " + a.glow + ";",
+    audioStates: Object.keys(AUDIO).map(k => ({
+      short: AUDIO[k].short,
+      style: "text-align:center;padding:4px 0;font-size:9px;letter-spacing:.12em;text-transform:uppercase;border:1px solid " +
+        (k === aKey ? AUDIO[k].color + "55;color:" + AUDIO[k].color + ";background:rgba(255,255,255,0.03)" : "#1a1e20;color:#3f4744;") + ";"
+    })),
+    levelBars,
+    levelText: hasLvl ? (lvl * 100).toFixed(0) + "%" : "no sig",
+    levelTextColor: hasLvl ? "#8d9793" : "#3a4240"
+  };
+}
+
+// ---------- DOM rendering (new — applies computeVals()'s output to the real page) ----------
+const $ = (id) => document.getElementById(id);
+
+function render(vals) {
+  $("linkLabel").textContent = vals.linkLabel;
+  $("linkDot").style.cssText = "width:6px;height:6px;background:" + vals.linkDotColor + ";box-shadow:0 0 7px " + vals.linkDotColor + ";";
+  $("linkLabel").style.color = vals.linkTextColor;
+  $("linkBox").title = vals.linkDiagnosis;
+  $("apiLabel").textContent = vals.apiLabel;
+  $("redactedBadge").hidden = !vals.redacted;
+  $("lastOkLabel").textContent = vals.lastOkLabel;
+  $("pollLabel").textContent = "poll " + vals.pollLabel;
+  $("clock").textContent = vals.clock;
+
+  $("main").style.filter = linkState() === "stale" ? "saturate(0.25) opacity(0.62)" : "";
+
+  // vitals (always exactly 4 rows)
+  $("vitalsList").innerHTML = vals.vitals.map(v => `
+    <div style="display: flex; flex-direction: column; gap: 6px;">
+      <div style="display: flex; align-items: baseline; justify-content: space-between; gap: 8px;">
+        <span style="font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: ${v.labelColor};">${v.label}</span>
+        <span style="font-size: 15px; font-weight: 500; color: ${v.valueColor};">${v.value}</span>
+      </div>
+      <div style="${v.trackStyle}"><div style="${v.fillStyle}"></div></div>
+      <div style="display: flex; justify-content: space-between; gap: 8px; font-size: 9px; letter-spacing: 0.1em; color: #363d3b; white-space: nowrap;">
+        <span style="min-width: 0; overflow: hidden; text-overflow: ellipsis;">${v.sub}</span>
+        <span style="flex: none;">${v.subRight}</span>
+      </div>
+    </div>`).join("");
+  $("vitalsStamp").textContent = vals.vitalsStamp;
+
+  // audio
+  $("audioDot").style.cssText = "flex:none;" + vals.audioDotStyle;
+  $("audioLabel").textContent = vals.audioLabel;
+  $("audioLabel").style.color = vals.audioColor;
+  $("audioStates").innerHTML = vals.audioStates.map(s => `<div style="${s.style}">${s.short}</div>`).join("");
+  $("levelBars").innerHTML = vals.levelBars.map(b => `<div style="${b.style}"></div>`).join("");
+  $("levelText").textContent = vals.levelText;
+  $("levelText").style.color = vals.levelTextColor;
+  $("audioNote").textContent = vals.audioNote;
+
+  // schedule
+  $("scheduleCountLabel").textContent = vals.scheduleCountLabel;
+  $("scheduleRedacted").hidden = !vals.scheduleRedacted;
+  $("scheduleNotice").hidden = !vals.scheduleNotice;
+  $("scheduleNoticeTitle").textContent = vals.scheduleNoticeTitle;
+  $("scheduleNoticeBody").textContent = vals.scheduleNoticeBody;
+  $("scheduleNoticeCode").textContent = vals.scheduleNoticeCode;
+  $("scheduleEmpty").hidden = !vals.scheduleEmpty;
+  $("eventsList").innerHTML = vals.events.map(e => `
+    <div style="display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 10px; padding: 10px 12px; border-bottom: 1px solid #131617;">
+      <div style="display: flex; flex-direction: column; gap: 2px;">
+        <span style="font-size: 13px; font-weight: 500; color: ${e.timeColor};">${e.time}</span>
+        <span style="font-size: 9px; letter-spacing: 0.08em; color: #454d4a;">${e.dur}</span>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 3px; min-width: 0;">
+        <span style="font-size: 12px; color: #b9c0bd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(e.summary)}</span>
+        <span style="font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: ${e.relColor};">${e.rel}</span>
+      </div>
+    </div>`).join("");
+
+  // vault
+  $("vaultStamp").textContent = vals.vaultStamp;
+  $("vaultRedacted").hidden = !vals.vaultRedacted;
+  $("vaultNotice").hidden = !vals.vaultNotice;
+  $("vaultNoticeTitle").textContent = vals.vaultNoticeTitle;
+  $("vaultNoticeBody").textContent = vals.vaultNoticeBody;
+  $("vaultNoticeCode").textContent = vals.vaultNoticeCode;
+  $("vaultOk").hidden = !vals.vaultOk;
+  $("taskCount").textContent = vals.taskCount;
+  $("excerpt").textContent = vals.excerpt;
+  $("excerpt").style.color = vals.excerptColor;
+
+  // command deck header + table layout
+  $("telemetryStamp").textContent = vals.telemetryStamp;
+  document.querySelectorAll(".timing-col").forEach(el => { el.style.display = vals.showTiming ? "" : "none"; });
+  $("tableHead").style.gridTemplateColumns = vals.gridCols;
+
+  // approval panel
+  $("approvalPanel").hidden = !vals.approvalPending;
+  if (vals.approvalPending) {
+    $("approvalDot").style.cssText = "width:7px;height:7px;flex:none;background:" + vals.approvalAccent + ";box-shadow:0 0 8px " + vals.approvalAccent + ";";
+    $("approvalHeaderLabel").style.color = vals.approvalAccent;
+    $("approvalPanel").style.background = vals.approvalWrapBg;
+    $("approvalPanel").style.boxShadow = "inset 3px 0 0 " + vals.approvalAccent;
+    $("approvalUnconfirmedNote").hidden = !vals.approvalUnconfirmed;
+    $("approvalElapsed").textContent = "waiting " + vals.approvalElapsed;
+    $("approvalBody").style.cssText = "display:grid;grid-template-columns:minmax(0, 1fr) auto;gap:16px;align-items:center;" + vals.approvalBodyFilter;
+    $("approvalEffect").textContent = vals.approvalEffect;
+    $("approvalEffect").style.cssText = vals.approvalEffectStyle;
+    $("approvalTool").textContent = vals.approvalTool;
+    $("approvalArgs").hidden = !vals.approvalArgsVisible;
+    $("approvalArgs").textContent = vals.approvalArgs;
+    $("approvalArgs").title = vals.approvalArgs;
+    $("approvalArgsRedacted").hidden = !vals.approvalArgsRedacted;
+    $("denyBtn").disabled = vals.approvalLocked;
+    $("denyBtn").style.cssText = "flex: none; padding: 6px 16px; font-size: 11px; letter-spacing: .16em; text-transform: uppercase; color: #d5dbd8; background: #14181a; border: 1px solid #333b3d; transition: background .15s ease;" + vals.denyDisabledStyle;
+    $("approveBtn").disabled = vals.approvalLocked;
+    $("approveBtn").style.cssText = vals.approveStyle;
+    $("approveBtn").textContent = vals.approveLabel;
+    $("approvalError").hidden = !vals.approvalError;
+    $("approvalError").textContent = vals.approvalErrorText;
+  }
+
+  // schema warning
+  $("schemaWarn").hidden = !vals.schemaWarn;
+  $("schemaWarnText").textContent = vals.schemaWarnText;
+
+  // telemetry rows
+  $("telemetryEmpty").hidden = !vals.telemetryEmpty;
+  $("telemetryNotice").hidden = !vals.telemetryNotice;
+  $("telemetryNoticeText").textContent = vals.telemetryNoticeText;
+  $("turnsList").innerHTML = vals.turns.map(t => `
+    <div style="${t.rowStyle} grid-template-columns:${vals.gridCols};">
+      <span style="font-size: 11px; color: ${t.timeColor};">${t.time}</span>
+      <span><span style="${t.pathStyle}">${t.path}</span></span>
+      <span style="text-align: right; font-size: 12px; color: ${t.durColor};">${t.dur}</span>
+      ${vals.showTiming ? `<span class="timing-col" style="text-align: right; font-size: 11px; color: #5d6663;">${t.stt}</span>` : ""}
+      ${vals.showTiming ? `<span class="timing-col" style="text-align: right; font-size: 11px; color: #5d6663;">${t.dispatch}</span>` : ""}
+      ${vals.showTiming ? `<span class="timing-col" style="text-align: right; font-size: 11px; color: #5d6663;">${t.tts}</span>` : ""}
+      <span style="padding-left: 12px; min-width: 0; display: flex; gap: 5px; align-items: center; overflow: hidden;">
+        ${t.tools.map(tool => `<span style="${tool.style}" title="${escapeHtml(tool.full)}">${escapeHtml(tool.name)}</span>`).join("")}
+        ${t.moreTools ? `<span style="flex: none; font-size: 10px; color: #5d6663;">${t.moreLabel}</span>` : ""}
+        ${t.noTools ? `<span style="font-size: 11px; color: #333a38;">—</span>` : ""}
+      </span>
+      <span style="text-align: right; font-size: 10px; letter-spacing: 0.08em; color: ${t.statusColor}; white-space: nowrap;">${escapeHtml(t.status)}</span>
+    </div>`).join("");
+
+  // stats footer
+  $("statTurns").textContent = vals.statTurns;
+  $("statSplit").textContent = vals.statSplit;
+  $("statP50").textContent = vals.statP50;
+  $("statP50").style.color = vals.statP50Color;
+  $("statErrors").textContent = vals.statErrors;
+  $("statErrors").style.color = vals.statErrColor;
+  $("statWindow").textContent = vals.statWindow;
+
+  // command bar
+  $("cmdReplyBar").hidden = !vals.cmdReplyVisible;
+  $("cmdReplyTag").textContent = vals.cmdReplyTag;
+  $("cmdReply").textContent = vals.cmdReply;
+  $("cmdReply").title = vals.cmdReply;
+  const cmdInput = $("cmdInput");
+  if (document.activeElement !== cmdInput) cmdInput.value = vals.cmdText;
+  cmdInput.placeholder = vals.cmdPlaceholder;
+  cmdInput.disabled = vals.cmdBusy;
+  $("cmdHint").textContent = vals.cmdHint;
+  $("cmdHint").style.color = vals.cmdHintColor;
+}
+
+function escapeHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+let renderQueued = false;
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => { renderQueued = false; render(computeVals()); });
+}
+
+// ---------- Row-count / narrow-layout measurement (was a ResizeObserver on the list) ----------
+function measure() {
+  const el = $("listWrap");
+  if (!el) return;
+  const h = el.clientHeight;
+  if (!h) { requestAnimationFrame(measure); return; }
+  const cap = Math.max(1, Math.floor(h / 33));
+  const narrow = el.clientWidth < 620;
+  if (cap !== STATE.rowCap || narrow !== STATE.narrow) setState({ rowCap: cap, narrow });
+}
+
+// ---------- Wiring ----------
+$("denyBtn").addEventListener("click", () => decide("deny"));
+$("approveBtn").addEventListener("click", () => decide("approve"));
+$("cmdInput").addEventListener("input", (e) => setState({ cmdText: e.target.value, cmdMsg: null, cmdErr: false, cmdReply: null, cmdTurnId: null }));
+$("cmdInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitCmd(); } });
+
+window.addEventListener("resize", measure);
+window.addEventListener("keydown", (e) => {
+  if (e.metaKey && e.shiftKey && (e.key === "h" || e.key === "H")) {
+    e.preventDefault();
+    setState({ redacted: !STATE.redacted });
+  }
+});
+// Drive audio state from elsewhere (the voice-loop process, a future bridge, or manual
+// testing) via: window.dispatchEvent(new CustomEvent("jarvis-audio", { detail: { state: "listening", level: 0.4 } }))
+window.addEventListener("jarvis-audio", (e) => {
+  const d = e.detail || {};
+  const next = {};
+  if (d.state && AUDIO[d.state]) next.state_ = d.state; // avoid shadowing STATE
+  if (d.state && AUDIO[d.state]) next.audio = d.state;
+  if (typeof d.level === "number") next.level = Math.max(0, Math.min(1, d.level));
+  else if ("level" in d && d.level == null) next.level = null;
+  delete next.state_;
+  if (Object.keys(next).length) setState(next);
+});
+
+const ro = new ResizeObserver(measure);
+ro.observe($("listWrap"));
+
+setInterval(() => { measure(); setState({ now: Date.now() }); }, 1000);
+setInterval(poll, pollMs());
+setInterval(pollApproval, Math.max(500, CONFIG.approvalPollMs || 1000));
+
+poll();
+pollApproval();
+requestAnimationFrame(measure);
+setTimeout(measure, 300);
+scheduleRender();
+</script>
+</body>
+</html>
