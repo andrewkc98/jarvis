@@ -9,6 +9,8 @@ not thread-scoped, so threads would not exercise them).
 from __future__ import annotations
 
 import multiprocessing
+import json
+import os
 import re
 import stat
 import uuid
@@ -227,9 +229,104 @@ def test_peek_expired_returns_none_and_deletes_file(tmp_path: Path) -> None:
 
 def test_claim_sets_0600_on_data_and_lock_files(tmp_path: Path) -> None:
     data, lock = _paths(tmp_path)
-    claim("vault_write", "desc", timeout_seconds=30, data_path=data, lock_path=lock)
+    previous_umask = os.umask(0)
+    try:
+        claim("vault_write", "desc", timeout_seconds=30, data_path=data, lock_path=lock)
+    finally:
+        os.umask(previous_umask)
     assert stat.S_IMODE(data.stat().st_mode) == 0o600
     assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+
+
+def _raw_record() -> dict[str, object]:
+    now = datetime.now(timezone.utc)
+    return {
+        "id": uuid.uuid4().hex,
+        "tool_name": "vault_write",
+        "description": "append a daily note",
+        "requested_at": (now - timedelta(seconds=1)).isoformat(),
+        "expires_at": (now + timedelta(seconds=30)).isoformat(),
+        "decision": None,
+        "decided_by": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("requested_at", "2026-09-03T12:00:00"),
+        ("expires_at", "2026-09-03T12:00:00"),
+        ("requested_at", "not-a-timestamp"),
+        ("expires_at", "not-a-timestamp"),
+        ("decision", "maybe"),
+        ("decided_by", "browser"),
+        ("decision", None),
+    ],
+)
+def test_invalid_record_is_fail_closed(tmp_path: Path, field: str, value: object) -> None:
+    data, lock = _paths(tmp_path)
+    raw = _raw_record()
+    if field == "decision" and value is None:
+        raw["decision"] = "allow"
+        raw["decided_by"] = None
+    else:
+        raw[field] = value
+    data.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert peek(data_path=data, lock_path=lock) is None
+    pending_id = str(raw["id"])
+    assert decide(pending_id, "allow", decided_by="hud", data_path=data, lock_path=lock) is False
+    clear(pending_id, data_path=data, lock_path=lock)
+
+    replacement = claim("vault_write", "replacement", timeout_seconds=30, data_path=data, lock_path=lock)
+    assert replacement is not None
+
+
+@pytest.mark.parametrize("contents", ["{", "null", "[]"])
+def test_corrupt_or_partial_record_is_absent(tmp_path: Path, contents: str) -> None:
+    data, lock = _paths(tmp_path)
+    data.write_text(contents, encoding="utf-8")
+    assert peek(data_path=data, lock_path=lock) is None
+    assert decide("anything", "deny", decided_by="terminal", data_path=data, lock_path=lock) is False
+    clear("anything", data_path=data, lock_path=lock)
+
+
+def test_legacy_lock_file_is_repaired_before_use(tmp_path: Path) -> None:
+    data, lock = _paths(tmp_path)
+    lock.write_bytes(b"")
+    lock.chmod(0o666)
+    claim("vault_write", "desc", timeout_seconds=30, data_path=data, lock_path=lock)
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+
+
+def test_atomic_record_update_uses_same_directory_temporary_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data, lock = _paths(tmp_path)
+    replacements: list[tuple[Path, Path, int]] = []
+    original_replace = os.replace
+
+    def tracking_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        replacements.append((source_path, destination_path, stat.S_IMODE(source_path.stat().st_mode)))
+        original_replace(source, destination)
+
+    monkeypatch.setattr(store.os, "replace", tracking_replace)
+    original = claim("vault_write", "desc", timeout_seconds=30, data_path=data, lock_path=lock)
+    assert original is not None
+    assert decide(original.id, "deny", decided_by="terminal", data_path=data, lock_path=lock) is True
+
+    assert len(replacements) == 2
+    for source, destination, mode in replacements:
+        assert source.parent == data.parent
+        assert source.name.startswith(f".{data.name}.")
+        assert destination == data
+        assert mode == 0o600
+        assert not source.exists()
+    reread = peek(data_path=data, lock_path=lock)
+    assert reread is not None
+    assert reread.id == original.id
+    assert reread.decision == "deny"
+    assert reread.decided_by == "terminal"
 
 
 # ---------------------------------------------------------------------------

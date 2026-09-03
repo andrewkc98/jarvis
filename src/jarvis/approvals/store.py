@@ -11,6 +11,7 @@ import dataclasses
 import fcntl
 import json
 import os
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -36,8 +37,16 @@ def _now() -> datetime:
 
 def _ensure_lock_file(lock_path: Path) -> None:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    if not lock_path.exists():
-        open(lock_path, "a", encoding="utf-8").close()
+    try:
+        fd = os.open(
+            lock_path,
+            os.O_CREAT | os.O_EXCL | os.O_RDWR,
+            0o600,
+        )
+    except FileExistsError:
+        pass
+    else:
+        os.close(fd)
     os.chmod(lock_path, 0o600)
 
 
@@ -46,20 +55,81 @@ def _read_locked(data_path: Path) -> PendingApproval | None:
         return None
     try:
         raw = json.loads(data_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, UnicodeError):
+        return None
+    if not isinstance(raw, dict):
         return None
     try:
-        return PendingApproval(**raw)
-    except TypeError:
+        record = PendingApproval(**raw)
+    except (TypeError, ValueError):
         return None
+
+    if not all(
+        isinstance(value, str)
+        for value in (
+            record.id,
+            record.tool_name,
+            record.description,
+            record.requested_at,
+            record.expires_at,
+        )
+    ):
+        return None
+    if record.decision not in (None, "allow", "deny"):
+        return None
+    if record.decided_by not in (None, "hud", "terminal"):
+        return None
+    if (record.decision is None) != (record.decided_by is None):
+        return None
+    for timestamp in (record.requested_at, record.expires_at):
+        try:
+            parsed = datetime.fromisoformat(timestamp)
+            timezone_offset = parsed.utcoffset()
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if parsed.tzinfo is None or timezone_offset is None:
+            return None
+    return record
 
 
 def _write_locked(data_path: Path, record: PendingApproval) -> None:
-    with open(data_path, "w", encoding="utf-8") as handle:
-        json.dump(dataclasses.asdict(record), handle)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(data_path, 0o600)
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    fd: int | None = None
+    try:
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{data_path.name}.",
+            dir=data_path.parent,
+        )
+        temporary_path = Path(temporary_name)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            json.dump(dataclasses.asdict(record), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, data_path)
+        temporary_path = None
+
+        try:
+            directory_fd = os.open(data_path.parent, os.O_RDONLY)
+        except OSError:
+            pass
+        else:
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(directory_fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _delete_locked(data_path: Path) -> None:
@@ -68,7 +138,11 @@ def _delete_locked(data_path: Path) -> None:
 
 
 def _is_expired(record: PendingApproval) -> bool:
-    return datetime.fromisoformat(record.expires_at) <= _now()
+    try:
+        expires_at = datetime.fromisoformat(record.expires_at)
+    except (TypeError, ValueError, OverflowError):
+        return True
+    return expires_at <= _now()
 
 
 def claim(
@@ -122,6 +196,8 @@ def decide(
 
     if decision not in ("allow", "deny"):
         raise ValueError(f"decision must be 'allow' or 'deny', got {decision!r}")
+    if decided_by not in ("hud", "terminal"):
+        raise ValueError(f"decided_by must be 'hud' or 'terminal', got {decided_by!r}")
     data_path = Path(data_path)
     lock_path = Path(lock_path)
     _ensure_lock_file(lock_path)

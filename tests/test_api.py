@@ -1,3 +1,6 @@
+import asyncio
+
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -228,6 +231,7 @@ def _pending_record(decision=None):
 @pytest.fixture
 def reset_service_singleton(monkeypatch):
     monkeypatch.setattr(api_main, "_service", None, raising=True)
+    monkeypatch.setattr(api_main, "_command_turn_lock", asyncio.Lock(), raising=True)
     return monkeypatch
 
 
@@ -367,6 +371,47 @@ def test_command_explicit_speak_false(monkeypatch, reset_service_singleton):
     assert FakeService.speak is False
 
 
+@pytest.mark.parametrize("invalid_speak", ["false", 0, 1, [], {}, None])
+def test_command_rejects_non_boolean_speak(
+    monkeypatch, reset_service_singleton, invalid_speak
+):
+    monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
+
+    class FakeService:
+        def __init__(self, voice_model_path):
+            raise AssertionError("should not construct service for bad request")
+
+    monkeypatch.setattr(api_main, "JarvisService", FakeService)
+    response = TestClient(build_app()).post(
+        "/command", json={"text": "hello", "speak": invalid_speak}
+    )
+    assert response.status_code == 422
+    assert response.json() == {"error": "invalid request"}
+    assert api_main._service is None
+
+
+@pytest.mark.parametrize("invalid_text", [123, [], {}, None])
+def test_command_rejects_non_string_text(
+    monkeypatch, reset_service_singleton, invalid_text
+):
+    monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
+
+    class FakeService:
+        def __init__(self, voice_model_path):
+            raise AssertionError("should not construct service for bad request")
+
+    monkeypatch.setattr(api_main, "JarvisService", FakeService)
+    response = TestClient(build_app()).post(
+        "/command", json={"text": invalid_text}
+    )
+    assert response.status_code == 422
+    if invalid_text is None:
+        assert response.json() == {"error": "text is required"}
+    else:
+        assert response.json() == {"error": "invalid request"}
+    assert api_main._service is None
+
+
 def test_command_reuses_single_service_instance(
     monkeypatch, reset_service_singleton
 ):
@@ -455,6 +500,92 @@ def test_command_aanswer_raises_returns_502(monkeypatch, reset_service_singleton
     response = client.post("/command", json={"text": "hello"})
     assert response.status_code == 502
     assert response.json() == {"error": "command_failed"}
+
+
+def test_concurrent_commands_serialize_service_turns(
+    monkeypatch, reset_service_singleton
+):
+    async def run():
+        monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        intervals = {}
+
+        class FakeService:
+            def __init__(self, voice_model_path):
+                pass
+
+            async def aanswer(self, text, *, speak=True, **kwargs):
+                loop = asyncio.get_running_loop()
+                started = loop.time()
+                intervals[text] = [started, None]
+                if text == "one":
+                    first_started.set()
+                    await release_first.wait()
+                intervals[text][1] = loop.time()
+                return f"answered:{text}"
+
+            async def aclose(self):
+                pass
+
+        monkeypatch.setattr(api_main, "JarvisService", FakeService)
+        transport = httpx.ASGITransport(app=build_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first = asyncio.create_task(client.post("/command", json={"text": "one"}))
+            await first_started.wait()
+            second = asyncio.create_task(client.post("/command", json={"text": "two"}))
+            await asyncio.sleep(0)
+            assert set(intervals) == {"one"}
+            release_first.set()
+            first_response, second_response = await asyncio.gather(first, second)
+
+        assert first_response.status_code == 200
+        assert second_response.status_code == 200
+        assert first_response.json() == {"response": "answered:one"}
+        assert second_response.json() == {"response": "answered:two"}
+        assert intervals["two"][0] >= intervals["one"][1]
+
+    asyncio.run(run())
+
+
+def test_shutdown_waits_for_active_command_turn(
+    monkeypatch, reset_service_singleton
+):
+    async def run():
+        monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
+        command_started = asyncio.Event()
+        release_command = asyncio.Event()
+        aclose_called = asyncio.Event()
+
+        class FakeService:
+            def __init__(self, voice_model_path):
+                pass
+
+            async def aanswer(self, text, *, speak=True, **kwargs):
+                command_started.set()
+                await release_command.wait()
+                return "finished"
+
+            async def aclose(self):
+                aclose_called.set()
+
+        monkeypatch.setattr(api_main, "JarvisService", FakeService)
+        lifecycle = api_main._lifespan(build_app())
+        await lifecycle.__aenter__()
+        transport = httpx.ASGITransport(app=build_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            request = asyncio.create_task(client.post("/command", json={"text": "hello"}))
+            await command_started.wait()
+            shutdown = asyncio.create_task(lifecycle.__aexit__(None, None, None))
+            await asyncio.sleep(0)
+            assert not aclose_called.is_set()
+            release_command.set()
+            assert (await request).json() == {"response": "finished"}
+            await shutdown
+
+        assert aclose_called.is_set()
+
+    asyncio.run(run())
 
 
 def test_client_shutdown_closes_service(monkeypatch, reset_service_singleton):

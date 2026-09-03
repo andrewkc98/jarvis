@@ -174,47 +174,65 @@ async def pre_tool_use_hook(input_data, tool_use_id, context):
 
     tool_input = input_data.get("tool_input", {})
     description = _format_pending_action(tool_name, tool_input)
-    claimed = approvals.claim(
-        tool_name, description, timeout_seconds=CONFIRMATION_TIMEOUT_SECONDS
-    )
-    deadline = time.monotonic() + CONFIRMATION_TIMEOUT_SECONDS
 
     async with _confirmation_lock:
-        tasks = [asyncio.create_task(_wait_terminal(description))]
-        if claimed is not None:
-            tasks.append(asyncio.create_task(_wait_hud(claimed.id, deadline)))
-
+        claimed = None
+        tasks: list[asyncio.Task] = []
         terminal_available = True
         channel: str | None = None
         decision: str | None = None
-        pending = set(tasks)
-        while pending:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            done, pending = await asyncio.wait(
-                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+        try:
+            claimed = approvals.claim(
+                tool_name, description, timeout_seconds=CONFIRMATION_TIMEOUT_SECONDS
             )
-            for task in done:
-                source, answer = task.result()
-                if source == "unavailable":
-                    terminal_available = False
-                    continue
-                if answer is not None:
-                    channel, decision = source, answer
-            if decision is not None:
-                break
+            deadline = time.monotonic() + CONFIRMATION_TIMEOUT_SECONDS
+            tasks.append(asyncio.create_task(_wait_terminal(description)))
+            if claimed is not None:
+                tasks.append(asyncio.create_task(_wait_hud(claimed.id, deadline)))
 
-        for task in pending:
-            task.cancel()
-        for task in tasks:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+            pending = set(tasks)
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                done, pending = await asyncio.wait(
+                    pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    source, answer = task.result()
+                    if source == "unavailable":
+                        terminal_available = False
+                        continue
+                    if answer is None:
+                        continue
+                    if claimed is None:
+                        channel, decision = source, answer
+                    else:
+                        approvals.decide(
+                            claimed.id,
+                            answer,
+                            decided_by=source,
+                        )
 
-    if claimed is not None:
-        approvals.clear(claimed.id)
+                if claimed is not None:
+                    current = approvals.peek()
+                    if (
+                        current is not None
+                        and current.id == claimed.id
+                        and current.decision is not None
+                    ):
+                        decision = current.decision
+                        channel = current.decided_by
+                        break
+                elif decision is not None:
+                    break
+        finally:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if claimed is not None:
+                approvals.clear(claimed.id)
 
     if decision == "allow":
         return {

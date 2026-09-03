@@ -425,7 +425,7 @@ def test_hook_hud_wins_race_when_no_terminal(monkeypatch):
         return types.SimpleNamespace(id="rid-1")
 
     def fake_peek(**kwargs):
-        return types.SimpleNamespace(id="rid-1", decision=state["decision"])
+        return types.SimpleNamespace(id="rid-1", decision=state["decision"], decided_by="hud")
 
     def fake_decide(pending_id, decision, **kwargs):
         if pending_id == "rid-1" and state["decision"] is None:
@@ -481,7 +481,7 @@ def test_hook_clear_called_once_on_deny_when_claim_succeeded(monkeypatch):
         return types.SimpleNamespace(id="rid-2")
 
     def fake_peek(**kwargs):
-        return types.SimpleNamespace(id="rid-2", decision=state["decision"])
+        return types.SimpleNamespace(id="rid-2", decision=state["decision"], decided_by="hud")
 
     def fake_decide(pending_id, decision, **kwargs):
         if pending_id == "rid-2" and state["decision"] is None:
@@ -599,7 +599,9 @@ def test_hook_hud_wins_and_terminal_task_is_cancelled(monkeypatch):
     monkeypatch.setattr(
         permissions.approvals,
         "peek",
-        lambda **kwargs: types.SimpleNamespace(id="rid-4", decision=state["decision"]),
+        lambda **kwargs: types.SimpleNamespace(
+            id="rid-4", decision=state["decision"], decided_by="hud"
+        ),
     )
     monkeypatch.setattr(
         permissions.approvals,
@@ -717,3 +719,216 @@ def test_hook_bypass_inactive_values_still_prompt(tool_name, env_value, monkeypa
         == "Confirmed by human via terminal."
     )
 
+
+def _install_fake_claim_store(monkeypatch, record_id="race-id"):
+    state = {"decision": None, "decided_by": None}
+    decisions = []
+
+    monkeypatch.setattr(
+        permissions.approvals,
+        "claim",
+        lambda tool_name, description, **kwargs: types.SimpleNamespace(id=record_id),
+    )
+
+    def fake_decide(pending_id, decision, *, decided_by, **kwargs):
+        if pending_id != record_id or state["decision"] is not None:
+            return False
+        state["decision"] = decision
+        state["decided_by"] = decided_by
+        decisions.append((decision, decided_by))
+        return True
+
+    def fake_peek(**kwargs):
+        return types.SimpleNamespace(
+            id=record_id,
+            decision=state["decision"],
+            decided_by=state["decided_by"],
+        )
+
+    monkeypatch.setattr(permissions.approvals, "decide", fake_decide)
+    monkeypatch.setattr(permissions.approvals, "peek", fake_peek)
+    cleared = []
+    monkeypatch.setattr(
+        permissions.approvals,
+        "clear",
+        lambda pending_id, **kwargs: cleared.append(pending_id),
+    )
+    return state, decisions, cleared
+
+
+def test_hook_hud_deny_beats_terminal_allow(monkeypatch):
+    monkeypatch.delenv("JARVIS_SKIP_CONFIRMATION", raising=False)
+    monkeypatch.setattr(permissions, "CONFIRMATION_TIMEOUT_SECONDS", 1.0)
+    state, decisions, cleared = _install_fake_claim_store(monkeypatch, "deny-first")
+
+    async def fake_read(prompt, timeout):
+        await asyncio.sleep(0.1)
+        return "y"
+
+    async def fake_hud(pending_id, deadline):
+        await asyncio.sleep(0.02)
+        permissions.approvals.decide(pending_id, "deny", decided_by="hud")
+        return ("hud", "deny")
+
+    monkeypatch.setattr(permissions, "read_line_with_timeout", fake_read)
+    monkeypatch.setattr(permissions, "_wait_hud", fake_hud)
+
+    async def run():
+        permissions._confirmation_lock = asyncio.Lock()
+        return await permissions.pre_tool_use_hook(
+            {"tool_name": "mcp__obsidian__vault_write", "tool_input": {}}, "id", None
+        )
+
+    result = asyncio.run(run())
+    assert state == {"decision": "deny", "decided_by": "hud"}
+    assert decisions == [("deny", "hud")]
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert result["hookSpecificOutput"]["permissionDecisionReason"] == "Declined by human via hud."
+    assert cleared == ["deny-first"]
+
+
+def test_hook_terminal_deny_beats_hud_allow(monkeypatch):
+    monkeypatch.delenv("JARVIS_SKIP_CONFIRMATION", raising=False)
+    monkeypatch.setattr(permissions, "CONFIRMATION_TIMEOUT_SECONDS", 1.0)
+    state, decisions, cleared = _install_fake_claim_store(monkeypatch, "terminal-first")
+
+    async def fake_read(prompt, timeout):
+        await asyncio.sleep(0.02)
+        return "n"
+
+    async def fake_hud(pending_id, deadline):
+        await asyncio.sleep(0.1)
+        permissions.approvals.decide(pending_id, "allow", decided_by="hud")
+        return ("hud", "allow")
+
+    monkeypatch.setattr(permissions, "read_line_with_timeout", fake_read)
+    monkeypatch.setattr(permissions, "_wait_hud", fake_hud)
+
+    async def run():
+        permissions._confirmation_lock = asyncio.Lock()
+        return await permissions.pre_tool_use_hook(
+            {"tool_name": "mcp__obsidian__vault_write", "tool_input": {}}, "id", None
+        )
+
+    result = asyncio.run(run())
+    assert state == {"decision": "deny", "decided_by": "terminal"}
+    assert decisions == [("deny", "terminal")]
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert result["hookSpecificOutput"]["permissionDecisionReason"] == "Declined by human via terminal."
+    assert cleared == ["terminal-first"]
+
+
+def test_hook_simultaneous_contenders_return_persisted_winner(monkeypatch):
+    monkeypatch.delenv("JARVIS_SKIP_CONFIRMATION", raising=False)
+    monkeypatch.setattr(permissions, "CONFIRMATION_TIMEOUT_SECONDS", 1.0)
+    state, decisions, _ = _install_fake_claim_store(monkeypatch, "simultaneous")
+
+    async def fake_read(prompt, timeout):
+        await asyncio.sleep(0)
+        return "y"
+
+    async def fake_hud(pending_id, deadline):
+        await asyncio.sleep(0)
+        return ("hud", "deny")
+
+    monkeypatch.setattr(permissions, "read_line_with_timeout", fake_read)
+    monkeypatch.setattr(permissions, "_wait_hud", fake_hud)
+
+    async def run():
+        permissions._confirmation_lock = asyncio.Lock()
+        return await permissions.pre_tool_use_hook(
+            {"tool_name": "mcp__obsidian__vault_write", "tool_input": {}}, "id", None
+        )
+
+    result = asyncio.run(run())
+    assert len(decisions) == 1
+    assert state["decision"] == decisions[0][0]
+    assert state["decided_by"] == decisions[0][1]
+    assert result["hookSpecificOutput"]["permissionDecision"] == state["decision"]
+    assert state["decided_by"] in result["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_queued_confirmation_gets_full_independent_window(monkeypatch):
+    monkeypatch.delenv("JARVIS_SKIP_CONFIRMATION", raising=False)
+    monkeypatch.setattr(permissions, "CONFIRMATION_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(
+        permissions.approvals,
+        "claim",
+        lambda tool_name, description, **kwargs: None,
+    )
+    calls = []
+
+    async def fake_read(prompt, timeout):
+        calls.append((time.monotonic(), timeout))
+        await asyncio.sleep(0.1)
+        return "y"
+
+    monkeypatch.setattr(permissions, "read_line_with_timeout", fake_read)
+
+    async def run():
+        permissions._confirmation_lock = asyncio.Lock()
+        started = time.monotonic()
+        results = await asyncio.gather(
+            permissions.pre_tool_use_hook(
+                {"tool_name": "mcp__obsidian__vault_write", "tool_input": {}}, "a", None
+            ),
+            permissions.pre_tool_use_hook(
+                {"tool_name": "mcp__obsidian__vault_write", "tool_input": {}}, "b", None
+            ),
+        )
+        return started, results
+
+    started, results = asyncio.run(run())
+    assert len(calls) == 2
+    assert all(timeout == 0.2 for _, timeout in calls)
+    assert calls[1][0] - calls[0][0] >= 0.09
+    assert all(result["hookSpecificOutput"]["permissionDecision"] == "allow" for result in results)
+
+
+def test_hook_cancellation_cleans_children_and_claim(monkeypatch):
+    monkeypatch.delenv("JARVIS_SKIP_CONFIRMATION", raising=False)
+    monkeypatch.setattr(permissions, "CONFIRMATION_TIMEOUT_SECONDS", 5.0)
+    started = asyncio.Event()
+    child_tasks = []
+    cleared = []
+    monkeypatch.setattr(
+        permissions.approvals,
+        "claim",
+        lambda tool_name, description, **kwargs: types.SimpleNamespace(id="cancel-id"),
+    )
+    monkeypatch.setattr(
+        permissions.approvals,
+        "peek",
+        lambda **kwargs: types.SimpleNamespace(id="cancel-id", decision=None),
+    )
+    monkeypatch.setattr(
+        permissions.approvals,
+        "clear",
+        lambda pending_id, **kwargs: cleared.append(pending_id),
+    )
+
+    async def wait_forever(*args):
+        child_tasks.append(asyncio.current_task())
+        if len(child_tasks) == 2:
+            started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(permissions, "_wait_terminal", wait_forever)
+    monkeypatch.setattr(permissions, "_wait_hud", wait_forever)
+
+    async def run():
+        permissions._confirmation_lock = asyncio.Lock()
+        task = asyncio.create_task(
+            permissions.pre_tool_use_hook(
+                {"tool_name": "mcp__obsidian__vault_write", "tool_input": {}}, "id", None
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert cleared == ["cancel-id"]
+    assert len(child_tasks) == 2
+    assert all(task.done() and task.cancelled() for task in child_tasks)

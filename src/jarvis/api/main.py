@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from contextlib import asynccontextmanager
 
@@ -26,6 +27,7 @@ def _truncated_excerpt(content: str) -> str:
 
 
 _service: JarvisService | None = None
+_command_turn_lock = asyncio.Lock()
 
 
 def _get_service() -> JarvisService:
@@ -40,8 +42,9 @@ def _get_service() -> JarvisService:
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     yield
-    if _service is not None:
-        await _service.aclose()
+    async with _command_turn_lock:
+        if _service is not None:
+            await _service.aclose()
 
 
 def _register_routes(app: FastAPI) -> None:
@@ -119,20 +122,25 @@ def _register_routes(app: FastAPI) -> None:
     @app.post("/command")
     async def post_command(body: dict):
         text = body.get("text")
-        if not text:
+        if text is None or text == "":
             return JSONResponse(
                 status_code=422, content={"error": "text is required"}
             )
+        if not isinstance(text, str):
+            return JSONResponse(status_code=422, content={"error": "invalid request"})
+        speak = body.get("speak", True)
+        if not isinstance(speak, bool):
+            return JSONResponse(status_code=422, content={"error": "invalid request"})
         if not config.VOICE_MODEL_PATH:
             return JSONResponse(
                 status_code=503, content={"error": "voice_model_not_configured"}
             )
-        speak = bool(body.get("speak", True))
-        try:
-            service = _get_service()
-            response = await service.aanswer(text, speak=speak)
-        except Exception:
-            return JSONResponse(status_code=502, content={"error": "command_failed"})
+        async with _command_turn_lock:
+            try:
+                service = _get_service()
+                response = await service.aanswer(text, speak=speak)
+            except Exception:
+                return JSONResponse(status_code=502, content={"error": "command_failed"})
         return {"response": response}
 
 
