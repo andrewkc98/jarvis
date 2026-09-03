@@ -13,3 +13,5 @@ telemetry.jsonl
 telemetry.jsonl.lock
 pending_approval.json
 pending_approval.json.lock
+runtime_status.json
+runtime_status.json.lock

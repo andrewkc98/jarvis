@@ -3,10 +3,12 @@ import threading
 from unittest.mock import Mock
 
 import numpy as np
+import pytest
 
 from jarvis.orchestrator.service import JarvisService, _speak_stream
 from jarvis.orchestrator import router, sdk_backend
 from jarvis.providers import schedule_provider
+from jarvis.runtime import status as runtime_status
 from jarvis.telemetry import store as telemetry_store
 from jarvis.voice import capture, stt, tts
 
@@ -14,6 +16,34 @@ from jarvis.voice import capture, stt, tts
 async def _fake_ask_stream(chunks):
     for chunk in chunks:
         yield chunk
+
+
+def _stub_runtime_status(monkeypatch):
+    calls = []
+    owner = object()
+    monkeypatch.setattr(runtime_status, "publisher", lambda source: owner)
+    monkeypatch.setattr(
+        runtime_status,
+        "publish",
+        lambda actual_owner, state, turn_id: calls.append(
+            ("publish", actual_owner, state, turn_id)
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_status,
+        "clear",
+        lambda actual_owner, turn_id: calls.append(
+            ("clear", actual_owner, turn_id)
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_status,
+        "fail",
+        lambda actual_owner, turn_id, code: calls.append(
+            ("fail", actual_owner, turn_id, code)
+        ),
+    )
+    return calls, owner
 
 
 class _RecordingSpeaker:
@@ -132,7 +162,9 @@ def test_run_once_calls_capture_stt_route_and_ask_stream_in_order(monkeypatch):
     events = []
     monkeypatch.setattr(
         capture, "record_on_enter",
-        Mock(side_effect=lambda: (events.append("capture"), audio)[1]),
+        Mock(
+            side_effect=lambda **kwargs: (events.append("capture"), audio)[1]
+        ),
     )
     monkeypatch.setattr(
         stt, "transcribe",
@@ -161,6 +193,215 @@ def test_run_once_calls_capture_stt_route_and_ask_stream_in_order(monkeypatch):
         ("ask_stream", "testing one two three"),
         ("tts", "spoken answer"),
     ]
+
+
+def test_voice_status_order_uses_one_turn_id(monkeypatch):
+    calls, owner = _stub_runtime_status(monkeypatch)
+    audio = np.array([0.1], dtype=np.float32)
+
+    def capture_start(**kwargs):
+        kwargs["on_started"]()
+        return audio
+
+    monkeypatch.setattr(capture, "record_on_enter", capture_start)
+    monkeypatch.setattr(stt, "transcribe", lambda value: "hello")
+    monkeypatch.setattr(router, "route", lambda text: "fallback")
+    monkeypatch.setattr(
+        sdk_backend.SDKBackend,
+        "ask_stream",
+        lambda self, prompt: _fake_ask_stream(["answer"]),
+    )
+    monkeypatch.setattr(tts.Speaker, "say", lambda self, text: None)
+
+    asyncio.run(JarvisService("voice.onnx", runtime_source="cli").arun_once())
+
+    assert [call[0] for call in calls] == [
+        "publish",
+        "publish",
+        "publish",
+        "clear",
+    ]
+    turn_ids = [call[-1] for call in calls]
+    assert len(set(turn_ids)) == 1
+    assert all(call[1] is owner for call in calls)
+    assert [call[2] for call in calls[:3]] == ["listening", "processing", "speaking"]
+
+
+@pytest.mark.parametrize("speak", [True, False])
+@pytest.mark.parametrize("error", [PermissionError("denied"), RuntimeError("down")])
+def test_schedule_handled_error_persists_after_optional_reply(
+    monkeypatch, speak, error
+):
+    calls, _ = _stub_runtime_status(monkeypatch)
+    monkeypatch.setattr(router, "route", lambda text: "schedule")
+    monkeypatch.setattr(
+        schedule_provider,
+        "get_upcoming_events",
+        Mock(side_effect=error),
+    )
+    spoken = []
+    monkeypatch.setattr(tts.Speaker, "say", lambda self, text: spoken.append(text))
+
+    result = asyncio.run(
+        JarvisService("voice.onnx").aanswer("calendar", speak=speak)
+    )
+
+    assert result
+    assert bool(spoken) is speak
+    fail_calls = [call for call in calls if call[0] == "fail"]
+    assert len(fail_calls) == 1
+    assert fail_calls[0][-1] == "schedule_failed"
+    fail_index = calls.index(fail_calls[0])
+    assert not any(call[0] == "clear" for call in calls[:fail_index])
+
+
+def test_cancelled_stream_failure_is_recorded_without_orphan_task(monkeypatch):
+    calls, _ = _stub_runtime_status(monkeypatch)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def chunks():
+        started.set()
+        await release.wait()
+        raise ConnectionError("late stream failure")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(router, "route", lambda text: "fallback")
+    monkeypatch.setattr(
+        sdk_backend.SDKBackend, "ask_stream", lambda self, prompt: chunks()
+    )
+    monkeypatch.setattr(tts.Speaker, "say", lambda self, text: None)
+
+    async def run():
+        service = JarvisService("voice.onnx")
+        loop = asyncio.get_running_loop()
+        loop_errors = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda loop, context: loop_errors.append(context))
+        turn = asyncio.create_task(service.aanswer("hello"))
+        try:
+            await started.wait()
+            turn.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await turn
+            release.set()
+            await asyncio.sleep(0.05)
+            assert any(
+                call[0] == "fail" and call[-1] == "sdk_failed" for call in calls
+            )
+            assert service._active_turn_id is None
+            assert loop_errors == []
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+    asyncio.run(run())
+
+
+def test_late_playback_cleanup_does_not_clear_newer_turn(monkeypatch):
+    calls = []
+    owner = object()
+    active = []
+    monkeypatch.setattr(runtime_status, "publisher", lambda source: owner)
+    monkeypatch.setattr(
+        runtime_status,
+        "publish",
+        lambda actual_owner, state, turn_id: (active.clear(), active.append(turn_id), calls.append(("publish", state, turn_id))),
+    )
+    def compare_clear(actual_owner, turn_id):
+        calls.append(("clear", turn_id))
+        if active == [turn_id]:
+            active.clear()
+    monkeypatch.setattr(runtime_status, "clear", compare_clear)
+    monkeypatch.setattr(
+        runtime_status,
+        "fail",
+        lambda actual_owner, turn_id, code: calls.append(("fail", turn_id, code)),
+    )
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = asyncio.Event()
+    release_second = asyncio.Event()
+
+    async def chunks(prompt):
+        if prompt == "first":
+            yield "first"
+        else:
+            second_started.set()
+            await release_second.wait()
+            yield "second"
+
+    monkeypatch.setattr(router, "route", lambda text: "fallback")
+    monkeypatch.setattr(
+        sdk_backend.SDKBackend,
+        "ask_stream",
+        lambda self, prompt: chunks(prompt),
+    )
+
+    def say(text):
+        first_started.set()
+        release_first.wait()
+
+    monkeypatch.setattr(tts.Speaker, "say", lambda self, text: say(text))
+
+    async def run():
+        service = JarvisService("voice.onnx")
+        first = asyncio.create_task(service.aanswer("first"))
+        await asyncio.to_thread(first_started.wait)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        second = asyncio.create_task(service.aanswer("second", speak=False))
+        await second_started.wait()
+        release_first.set()
+        await asyncio.sleep(0.05)
+
+        assert active and len(active) == 1
+
+        release_second.set()
+        assert await second == "second"
+
+    asyncio.run(run())
+
+
+def test_close_clears_active_non_playback_turn_after_backend_close(monkeypatch):
+    calls, _ = _stub_runtime_status(monkeypatch)
+    stream_started = asyncio.Event()
+    release_stream = asyncio.Event()
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def chunks():
+        stream_started.set()
+        await release_stream.wait()
+        yield "answer"
+
+    monkeypatch.setattr(router, "route", lambda text: "fallback")
+    monkeypatch.setattr(
+        sdk_backend.SDKBackend, "ask_stream", lambda self, prompt: chunks()
+    )
+
+    async def fake_close(self):
+        close_started.set()
+        await release_close.wait()
+
+    monkeypatch.setattr(sdk_backend.SDKBackend, "close", fake_close)
+
+    async def run():
+        service = JarvisService("voice.onnx")
+        turn = asyncio.create_task(service.aanswer("hello", speak=False))
+        await stream_started.wait()
+        closing = asyncio.create_task(service.aclose())
+        await close_started.wait()
+        await asyncio.sleep(0)
+        assert not any(call[0] == "clear" for call in calls)
+        release_close.set()
+        await closing
+        assert any(call[0] == "clear" for call in calls)
+        release_stream.set()
+        assert await turn == "answer"
+
+    asyncio.run(run())
 
 
 def test_schedule_query_uses_schedule_provider_and_never_touches_sdk_backend(monkeypatch):
@@ -377,11 +618,19 @@ def test_telemetry_failure_does_not_break_successful_turn(monkeypatch, capsys):
 def test_arun_once_passes_stt_ms_while_arun_text_does_not(monkeypatch):
     captured = {}
 
-    async def record_answer(self, text, *, stt_ms=None):
+    async def record_answer(
+        self,
+        text,
+        *,
+        stt_ms=None,
+        speak=True,
+        turn_id=None,
+        publish_processing=True,
+    ):
         captured["stt_ms"] = stt_ms
         return "ok"
 
-    monkeypatch.setattr(JarvisService, "aanswer", record_answer)
+    monkeypatch.setattr(JarvisService, "_answer_with_turn", record_answer)
 
     # arun_once: stt_ms must be a concrete (non-None) measurement.
     monkeypatch.setattr(
@@ -482,4 +731,3 @@ def test_telemetry_shape_is_independent_of_speak_sdk(monkeypatch):
 
     assert shapes[0] == ("sdk", ["mcp__vault__read"], None)
     assert shapes[1] == shapes[0]
-

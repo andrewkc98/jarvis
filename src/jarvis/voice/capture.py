@@ -1,7 +1,9 @@
 """Push-to-talk audio capture utilities."""
 
 from pathlib import Path
+import sys
 import wave
+from collections.abc import Callable
 
 import numpy as np
 import sounddevice as sd
@@ -11,6 +13,7 @@ def record_on_enter(
     samplerate: int = 16000,
     channels: int = 1,
     save_path: Path | None = None,
+    on_started: Callable[[], None] | None = None,
 ) -> np.ndarray:
     """Record from the default input device between two Enter keypresses.
 
@@ -42,6 +45,14 @@ def record_on_enter(
         except BaseException:
             pass
         raise
+    if on_started is not None:
+        try:
+            on_started()
+        except Exception as error:
+            print(
+                f"capture-start callback failed: {error}",
+                file=sys.stderr,
+            )
     try:
         print("Recording... press Enter to stop.")
         input()

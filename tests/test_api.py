@@ -147,6 +147,63 @@ def test_telemetry_limit_validation(monkeypatched_client):
     assert client.get("/telemetry", params={"limit": 201}).status_code == 422
 
 
+def test_runtime_status_returns_exact_safe_snapshot(monkeypatch, reset_service_singleton):
+    snapshot = {
+        "state": "speaking",
+        "source": "api",
+        "updated_at": "2026-09-03T12:00:00+00:00",
+        "error_code": None,
+        "instances": {"private": "must not be exposed"},
+    }
+    monkeypatch.setattr(api_main.runtime_status, "snapshot", lambda: snapshot)
+    response = TestClient(build_app()).get("/runtime-status")
+    assert response.status_code == 200
+    assert response.json() == {
+        "state": "speaking",
+        "source": "api",
+        "updated_at": "2026-09-03T12:00:00+00:00",
+        "error_code": None,
+    }
+
+
+def test_runtime_status_error_shape_is_safe(monkeypatch, reset_service_singleton):
+    monkeypatch.setattr(
+        api_main.runtime_status,
+        "snapshot",
+        lambda: {
+            "state": "error",
+            "source": "cli",
+            "updated_at": "2026-09-03T12:00:00+00:00",
+            "error_code": "sdk_failed",
+        },
+    )
+    response = TestClient(build_app()).get("/runtime-status")
+    assert response.status_code == 200
+    assert response.json() == {
+        "state": "error",
+        "source": "cli",
+        "updated_at": "2026-09-03T12:00:00+00:00",
+        "error_code": "sdk_failed",
+    }
+
+
+def test_runtime_status_store_failure_returns_canonical_idle(
+    monkeypatch, reset_service_singleton
+):
+    def fail_snapshot():
+        raise RuntimeError("sensitive backend detail")
+
+    monkeypatch.setattr(api_main.runtime_status, "snapshot", fail_snapshot)
+    response = TestClient(build_app()).get("/runtime-status")
+    assert response.status_code == 200
+    assert response.json() == {
+        "state": "idle",
+        "source": None,
+        "updated_at": None,
+        "error_code": None,
+    }
+
+
 def test_cors_header_absent_when_hud_origin_unset(monkeypatch):
     monkeypatch.setattr(config, "HUD_ORIGIN", None, raising=True)
     client = TestClient(build_app())
@@ -328,7 +385,7 @@ def test_command_success_and_speak_default(monkeypatch, reset_service_singleton)
     monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
 
     class FakeService:
-        def __init__(self, voice_model_path):
+        def __init__(self, voice_model_path, runtime_source="api"):
             FakeService.constructed += 1
 
         async def aanswer(self, text, *, speak=True, **kwargs):
@@ -354,7 +411,7 @@ def test_command_explicit_speak_false(monkeypatch, reset_service_singleton):
     monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
 
     class FakeService:
-        def __init__(self, voice_model_path):
+        def __init__(self, voice_model_path, runtime_source="api"):
             pass
 
         async def aanswer(self, text, *, speak=True, **kwargs):
@@ -378,7 +435,7 @@ def test_command_rejects_non_boolean_speak(
     monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
 
     class FakeService:
-        def __init__(self, voice_model_path):
+        def __init__(self, voice_model_path, runtime_source="api"):
             raise AssertionError("should not construct service for bad request")
 
     monkeypatch.setattr(api_main, "JarvisService", FakeService)
@@ -397,7 +454,7 @@ def test_command_rejects_non_string_text(
     monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
 
     class FakeService:
-        def __init__(self, voice_model_path):
+        def __init__(self, voice_model_path, runtime_source="api"):
             raise AssertionError("should not construct service for bad request")
 
     monkeypatch.setattr(api_main, "JarvisService", FakeService)
@@ -419,7 +476,7 @@ def test_command_reuses_single_service_instance(
     constructed = []
 
     class FakeService:
-        def __init__(self, voice_model_path):
+        def __init__(self, voice_model_path, runtime_source="api"):
             constructed.append(voice_model_path)
 
         async def aanswer(self, text, *, speak=True, **kwargs):
@@ -444,7 +501,7 @@ def test_command_missing_text(monkeypatch, reset_service_singleton):
     monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
 
     class FakeService:
-        def __init__(self, voice_model_path):
+        def __init__(self, voice_model_path, runtime_source="api"):
             raise AssertionError("should not construct service for bad request")
 
         async def aanswer(self, text, *, speak=True):
@@ -502,6 +559,31 @@ def test_command_aanswer_raises_returns_502(monkeypatch, reset_service_singleton
     assert response.json() == {"error": "command_failed"}
 
 
+def test_command_constructor_uses_api_runtime_source_and_records_safe_error(
+    monkeypatch, reset_service_singleton
+):
+    monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
+    constructor_args = []
+    recorded_errors = []
+
+    class FakeService:
+        def __init__(self, voice_model_path, runtime_source):
+            constructor_args.append((voice_model_path, runtime_source))
+            raise RuntimeError("sensitive constructor detail")
+
+    monkeypatch.setattr(api_main, "JarvisService", FakeService)
+    monkeypatch.setattr(
+        api_main.runtime_status,
+        "record_error",
+        lambda source, code: recorded_errors.append((source, code)),
+    )
+    response = TestClient(build_app()).post("/command", json={"text": "hello"})
+    assert response.status_code == 502
+    assert response.json() == {"error": "command_failed"}
+    assert constructor_args == [("/tmp/voice.onnx", "api")]
+    assert recorded_errors == [("api", "service_unavailable")]
+
+
 def test_concurrent_commands_serialize_service_turns(
     monkeypatch, reset_service_singleton
 ):
@@ -512,7 +594,7 @@ def test_concurrent_commands_serialize_service_turns(
         intervals = {}
 
         class FakeService:
-            def __init__(self, voice_model_path):
+            def __init__(self, voice_model_path, runtime_source="api"):
                 pass
 
             async def aanswer(self, text, *, speak=True, **kwargs):
@@ -558,7 +640,7 @@ def test_shutdown_waits_for_active_command_turn(
         aclose_called = asyncio.Event()
 
         class FakeService:
-            def __init__(self, voice_model_path):
+            def __init__(self, voice_model_path, runtime_source="api"):
                 pass
 
             async def aanswer(self, text, *, speak=True, **kwargs):
@@ -593,7 +675,7 @@ def test_client_shutdown_closes_service(monkeypatch, reset_service_singleton):
     aclose_calls = []
 
     class FakeService:
-        def __init__(self, voice_model_path):
+        def __init__(self, voice_model_path, runtime_source="api"):
             pass
 
         async def aanswer(self, text, *, speak=True, **kwargs):
@@ -615,7 +697,7 @@ def test_client_shutdown_without_service_does_not_call_aclose(
     aclose_calls = []
 
     class FakeService:
-        def __init__(self, voice_model_path):
+        def __init__(self, voice_model_path, runtime_source="api"):
             pass
 
         async def aclose(self):

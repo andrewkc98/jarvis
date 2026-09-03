@@ -7,7 +7,7 @@ from jarvis.orchestrator.service import JarvisService
 
 
 async def _amain(args) -> str:
-    service = JarvisService(voice_model_path=args.voice_model)
+    service = JarvisService(voice_model_path=args.voice_model, runtime_source="cli")
     try:
         if args.text is not None:
             return await service.arun_text(args.text)

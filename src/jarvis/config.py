@@ -33,6 +33,8 @@ TELEMETRY_PATH = Path(__file__).resolve().parents[2] / "telemetry.jsonl"
 TELEMETRY_LOCK_PATH = TELEMETRY_PATH.with_suffix(".jsonl.lock")
 PENDING_APPROVAL_PATH = Path(__file__).resolve().parents[2] / "pending_approval.json"
 PENDING_APPROVAL_LOCK_PATH = PENDING_APPROVAL_PATH.with_suffix(".json.lock")
+RUNTIME_STATUS_PATH = Path(__file__).resolve().parents[2] / "runtime_status.json"
+RUNTIME_STATUS_LOCK_PATH = RUNTIME_STATUS_PATH.with_suffix(".json.lock")
 VOICE_MODEL_PATH = os.environ.get("JARVIS_VOICE_MODEL") or None
 
 

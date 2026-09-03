@@ -14,6 +14,7 @@ from jarvis import config
 from jarvis.approvals import store as approvals
 from jarvis.orchestrator.service import JarvisService
 from jarvis.providers import schedule_provider, vault_provider
+from jarvis.runtime import status as runtime_status
 from jarvis.telemetry import store
 from jarvis.tools import vitals
 
@@ -28,6 +29,48 @@ def _truncated_excerpt(content: str) -> str:
 
 _service: JarvisService | None = None
 _command_turn_lock = asyncio.Lock()
+_RUNTIME_STATES = frozenset({"listening", "processing", "speaking", "error"})
+
+
+def _idle_runtime_status() -> dict[str, object]:
+    return {"state": "idle", "source": None, "updated_at": None, "error_code": None}
+
+
+def _safe_runtime_status() -> dict[str, object]:
+    try:
+        raw = runtime_status.snapshot()
+        if not isinstance(raw, dict):
+            return _idle_runtime_status()
+        state = raw.get("state")
+        if state == "idle":
+            return _idle_runtime_status()
+        if state not in _RUNTIME_STATES:
+            return _idle_runtime_status()
+        source = raw.get("source")
+        updated_at = raw.get("updated_at")
+        if source not in runtime_status.SOURCES or not isinstance(updated_at, str):
+            return _idle_runtime_status()
+        runtime_status._parse_aware_timestamp(updated_at, "updated_at")
+        if state == "error":
+            error_code = raw.get("error_code")
+            if error_code not in runtime_status.ERROR_CODES:
+                return _idle_runtime_status()
+            return {
+                "state": "error",
+                "source": source,
+                "updated_at": updated_at,
+                "error_code": error_code,
+            }
+        if raw.get("error_code") is not None:
+            return _idle_runtime_status()
+        return {
+            "state": state,
+            "source": source,
+            "updated_at": updated_at,
+            "error_code": None,
+        }
+    except Exception:
+        return _idle_runtime_status()
 
 
 def _get_service() -> JarvisService:
@@ -35,7 +78,9 @@ def _get_service() -> JarvisService:
     if _service is None:
         if not config.VOICE_MODEL_PATH:
             raise RuntimeError("JARVIS_VOICE_MODEL is not set")
-        _service = JarvisService(voice_model_path=config.VOICE_MODEL_PATH)
+        _service = JarvisService(
+            voice_model_path=config.VOICE_MODEL_PATH, runtime_source="api"
+        )
     return _service
 
 
@@ -94,6 +139,10 @@ def _register_routes(app: FastAPI) -> None:
     def get_telemetry(limit: int = Query(default=20, ge=1, le=200)) -> dict:
         return {"entries": store.read_recent(limit)}
 
+    @app.get("/runtime-status")
+    def get_runtime_status() -> dict:
+        return _safe_runtime_status()
+
     @app.get("/pending-approval")
     def get_pending_approval() -> dict:
         record = approvals.peek()
@@ -138,6 +187,13 @@ def _register_routes(app: FastAPI) -> None:
         async with _command_turn_lock:
             try:
                 service = _get_service()
+            except Exception:
+                try:
+                    runtime_status.record_error("api", "service_unavailable")
+                except Exception:
+                    pass
+                return JSONResponse(status_code=502, content={"error": "command_failed"})
+            try:
                 response = await service.aanswer(text, speak=speak)
             except Exception:
                 return JSONResponse(status_code=502, content={"error": "command_failed"})

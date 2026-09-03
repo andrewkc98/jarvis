@@ -65,7 +65,14 @@
           <span id="audioDot" style="flex: none;"></span>
           <span id="audioLabel" style="font-size: 17px; font-weight: 500; letter-spacing: 0.14em; text-transform: uppercase;"></span>
         </div>
-        <div id="audioStates" style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-bottom: 10px;"></div>
+        <div id="audioStates" style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; margin-bottom: 10px;"></div>
+        <div id="runtimeNotice" hidden style="display: flex; gap: 8px; align-items: flex-start; margin-bottom: 10px; padding: 7px 8px; border-left: 2px solid #e0674f; background: rgba(224,103,79,0.07);">
+          <span style="font-size: 10px; color: #e0674f;">!</span>
+          <div style="display: flex; flex-direction: column; gap: 3px; min-width: 0;">
+            <span id="runtimeNoticeTitle" style="font-size: 10px; letter-spacing: 0.08em; color: #ec8f6c;"></span>
+            <span id="runtimeNoticeText" style="font-size: 10px; line-height: 1.4; color: #8d6b64;"></span>
+          </div>
+        </div>
         <div style="display: flex; align-items: center; gap: 8px;">
           <span style="flex: none; font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; color: #3f4744;">level</span>
           <div id="levelBars" style="flex: 1; display: flex; gap: 2px; height: 10px; align-items: center; min-width: 0;"></div>
@@ -207,6 +214,10 @@
     <div style="flex: none; display: flex; align-items: center; gap: 9px; padding: 8px 12px; border-top: 1px solid #1b1f21; background: #090b0c; min-width: 0;">
       <span style="flex: none; font-size: 13px; color: #4fe0cf;">&#8250;</span>
       <input type="text" id="cmdInput" spellcheck="false" style="flex: 1; min-width: 0; font-size: 12px; color: #d5dbd8; letter-spacing: 0.02em; caret-color: #4fe0cf;" />
+      <label for="speakToggle" style="display: flex; align-items: center; gap: 5px; flex: none; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; color: #6d7673; cursor: pointer;">
+        <input type="checkbox" id="speakToggle" checked style="accent-color: #4fe0cf; cursor: pointer;">
+        <span>Speak reply</span>
+      </label>
       <span id="cmdHint" style="flex: none; font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase;"></span>
     </div>
   </section>
@@ -292,8 +303,22 @@ const AUDIO = {
   idle:       { label: "idle",       short: "idle",   color: "#6d7673", glow: "rgba(120,132,128,0.35)" },
   listening:  { label: "listening",  short: "listen", color: "#4fe0cf", glow: "rgba(79,224,207,0.55)" },
   processing: { label: "processing", short: "proc",   color: "#c99a3e", glow: "rgba(201,154,62,0.5)" },
-  speaking:   { label: "speaking",   short: "speak",  color: "#7cc4f0", glow: "rgba(124,196,240,0.5)" }
+  speaking:   { label: "speaking",   short: "speak",  color: "#7cc4f0", glow: "rgba(124,196,240,0.5)" },
+  error:      { label: "error",      short: "error",  color: "#e0674f", glow: "rgba(224,103,79,0.5)" }
 };
+
+const RUNTIME_ERRORS = {
+  capture_failed:       { title: "Audio capture failed", text: "The microphone turn could not start or complete. Try again." },
+  stt_failed:           { title: "Transcription failed", text: "The captured audio could not be transcribed. Try again." },
+  routing_failed:       { title: "Routing failed", text: "The assistant could not classify this turn." },
+  schedule_failed:      { title: "Schedule unavailable", text: "The calendar request failed. Check Calendar access and try again." },
+  sdk_failed:            { title: "Assistant unavailable", text: "The assistant turn failed before a response was ready." },
+  tts_failed:            { title: "Playback failed", text: "The response was ready, but local speech playback failed." },
+  service_unavailable:   { title: "Assistant service unavailable", text: "The local assistant service could not be constructed." }
+};
+
+const RUNTIME_STATES = new Set(["idle", "listening", "processing", "speaking", "error"]);
+const RUNTIME_SOURCES = new Set(["api", "cli"]);
 
 const NOTICES = {
   calendar_permission_required: {
@@ -320,6 +345,7 @@ const STATE = {
   vault: null, vaultErr: null, telemetry: null, telemetryErr: null,
   approval: null, approvalErr: null, approvalBusy: false, approvalUnconfirmed: false,
   audio: null, level: null,
+  runtime: null, runtimeValid: false, runtimeErr: null,
   cmdText: "", cmdBusy: false, cmdMsg: null, cmdErr: false, cmdReply: null, cmdTurnId: null,
   redacted: false
 };
@@ -367,6 +393,52 @@ async function poll() {
   });
 }
 
+let runtimeFetchSequence = 0;
+
+function isAwareIso(value) {
+  return typeof value === "string" && /(?:Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value));
+}
+
+function validateRuntimeSnapshot(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const keys = Object.keys(data).sort().join(",");
+  if (keys !== "error_code,source,state,updated_at") return null;
+  const { state, source, updated_at: updatedAt, error_code: errorCode } = data;
+  if (!RUNTIME_STATES.has(state)) return null;
+  if (state === "idle") {
+    return source === null && updatedAt === null && errorCode === null
+      ? { state: "idle", source: null, updated_at: null, error_code: null }
+      : null;
+  }
+  if (!RUNTIME_SOURCES.has(source) || !isAwareIso(updatedAt)) return null;
+  if (state === "error") {
+    return Object.prototype.hasOwnProperty.call(RUNTIME_ERRORS, errorCode)
+      ? { state, source, updated_at: updatedAt, error_code: errorCode }
+      : null;
+  }
+  return errorCode === null
+    ? { state, source, updated_at: updatedAt, error_code: null }
+    : null;
+}
+
+async function pollRuntimeStatus() {
+  const sequence = ++runtimeFetchSequence;
+  const result = await req("/runtime-status");
+  if (sequence !== runtimeFetchSequence) return;
+  if (result.down || result.err) {
+    // Keep the last valid snapshot. A status transport failure should not turn a
+    // previously live API link into a false subsystem verdict.
+    setState({ runtimeErr: result.err || "runtime_unavailable" });
+    return;
+  }
+  const snapshot = validateRuntimeSnapshot(result.data);
+  if (!snapshot) {
+    setState({ runtimeErr: "runtime_invalid" });
+    return;
+  }
+  setState({ runtime: snapshot, runtimeValid: true, runtimeErr: null });
+}
+
 async function pollApproval() {
   const r = await req("/pending-approval");
   // A failed poll never clears a pending decision — the backend is still
@@ -408,13 +480,14 @@ async function decide(verb) {
 async function submitCmd() {
   const text = STATE.cmdText.trim();
   if (!text || STATE.cmdBusy) return;
+  const speak = $("speakToggle").checked;
   setState({ cmdBusy: true, cmdMsg: null, cmdErr: false, cmdReply: null });
   // A real dispatch can spend up to 30s just waiting on a gated tool's confirmation
   // (CONFIRMATION_TIMEOUT_SECONDS), on top of the SDK turn itself, on top of full
   // TTS playback if speak=true — the server doesn't respond until the machine has
   // finished talking. 90s covers that comfortably without being unbounded.
   const r = await req("/command", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text })
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text, speak })
   }, 90000);
   if (r.down || r.err) {
     setState({ cmdBusy: false, cmdErr: true, cmdMsg: r.err || (r.kind === "timeout" ? "no response" : "refused") });
@@ -624,7 +697,10 @@ function computeVals() {
   const errN = entries.filter(e => e.error).length;
 
   // ---- audio + level meter ----
-  const aKey = st.audio || CONFIG.audioState || "idle";
+  const runtimeState = st.runtimeValid && st.runtime ? st.runtime.state : null;
+  const runtimeNotice = runtimeState === "error" && RUNTIME_ERRORS[st.runtime.error_code]
+    ? RUNTIME_ERRORS[st.runtime.error_code] : null;
+  const aKey = st.runtimeValid ? (runtimeState || "idle") : (st.audio || CONFIG.audioState || "idle");
   const a = AUDIO[aKey] || AUDIO.idle;
   const lvl = st.level;
   const hasLvl = typeof lvl === "number";
@@ -641,7 +717,8 @@ function computeVals() {
     idle: "push-to-talk · hold " + binding,
     listening: "capturing input · stt streaming",
     processing: "dispatching turn · awaiting response",
-    speaking: "tts playback active"
+    speaking: "tts playback active",
+    error: "runtime error · see status notice"
   };
 
   const diag = st.downKind === "timeout"
@@ -660,6 +737,9 @@ function computeVals() {
     lastOkLabel: st.lastOk ? "last ok " + fmtAge(now - st.lastOk) + " ago" : "never polled",
     apiLabel: base() + (st.downKind ? " · " + st.downKind : ""),
     pollLabel: (pollMs() / 1000).toFixed(0) + "s",
+    runtimeNotice: !!runtimeNotice,
+    runtimeNoticeTitle: runtimeNotice ? runtimeNotice.title : "",
+    runtimeNoticeText: runtimeNotice ? runtimeNotice.text : "",
 
     vitals,
     vitalsStamp: usingMock ? "sample" : link === "stale" ? "last known" : "host",
@@ -732,6 +812,7 @@ function computeVals() {
     cmdPlaceholder: st.cmdBusy ? "dispatching…" : "type a command · runs the same pipeline, stt skipped",
     cmdHint: st.cmdMsg ? st.cmdMsg : st.cmdText.trim() ? "↵ send" : "text path",
     cmdHintColor: st.cmdErr ? "#e0674f" : st.cmdMsg ? "#4fe0cf" : "#3f4744",
+    cmdSpeak: $("speakToggle") ? $("speakToggle").checked : true,
     cmdReplyVisible: !!st.cmdReply,
     cmdReply: st.cmdReply || "",
     cmdReplyTag: st.cmdTurnId ? "turn " + st.cmdTurnId : "reply",
@@ -787,6 +868,9 @@ function render(vals) {
   $("audioLabel").textContent = vals.audioLabel;
   $("audioLabel").style.color = vals.audioColor;
   $("audioStates").innerHTML = vals.audioStates.map(s => `<div style="${s.style}">${s.short}</div>`).join("");
+  $("runtimeNotice").hidden = !vals.runtimeNotice;
+  $("runtimeNoticeTitle").textContent = vals.runtimeNoticeTitle;
+  $("runtimeNoticeText").textContent = vals.runtimeNoticeText;
   $("levelBars").innerHTML = vals.levelBars.map(b => `<div style="${b.style}"></div>`).join("");
   $("levelText").textContent = vals.levelText;
   $("levelText").style.color = vals.levelTextColor;
@@ -897,6 +981,8 @@ function render(vals) {
   if (document.activeElement !== cmdInput) cmdInput.value = vals.cmdText;
   cmdInput.placeholder = vals.cmdPlaceholder;
   cmdInput.disabled = vals.cmdBusy;
+  $("speakToggle").checked = vals.cmdSpeak;
+  $("speakToggle").disabled = vals.cmdBusy;
   $("cmdHint").textContent = vals.cmdHint;
   $("cmdHint").style.color = vals.cmdHintColor;
 }
@@ -956,9 +1042,11 @@ ro.observe($("listWrap"));
 
 setInterval(() => { measure(); setState({ now: Date.now() }); }, 1000);
 setInterval(poll, pollMs());
+setInterval(pollRuntimeStatus, pollMs());
 setInterval(pollApproval, Math.max(500, CONFIG.approvalPollMs || 1000));
 
 poll();
+pollRuntimeStatus();
 pollApproval();
 requestAnimationFrame(measure);
 setTimeout(measure, 300);
