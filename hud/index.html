@@ -229,12 +229,14 @@
  * applies computed values to the real DOM, replacing the original's `{{ }}` bindings
  * and `<sc-if>`/`<sc-for>` directives).
  *
- * KNOWN GAP: /pending-approval, /allow, /deny, and /command are not yet implemented
- * by the real Jarvis backend (as of this writing, only /vitals, /schedule,
- * /vault-summary, /telemetry are planned/real). The approval panel and command input
- * below are fully wired and will work the moment those endpoints exist; until then
- * they simply never activate (pollApproval() finds nothing pending, submitCmd() will
- * report a connection/404 failure if used). See .agent/PLAN.md for that work.
+ * /pending-approval, /allow, /deny, and /command are real, implemented by
+ * src/jarvis/api/main.py (Phase 4b) — the API process races a terminal-attached
+ * confirmation prompt against a HUD decision, whichever answers first. Their JSON
+ * shapes differ from what the render layer expects internally, so pollApproval()
+ * and submitCmd() adapt at the boundary (tool_name -> tool, description ->
+ * args_preview, an effect derived client-side since the backend doesn't send one,
+ * {"pending": ...} unwrapped, {"response": ...} instead of {"reply": ...}) rather
+ * than changing the shape everywhere else that already matches the mock data.
  */
 
 // ---------- Configuration — edit these directly, no build step needed ----------
@@ -370,8 +372,19 @@ async function pollApproval() {
   // A failed poll never clears a pending decision — the backend is still
   // blocked on it. Keep it on screen, flagged unconfirmed.
   if (r.down || r.err) { if (STATE.approval && !STATE.approvalUnconfirmed) setState({ approvalUnconfirmed: true }); return; }
-  const d = r.data;
-  const pending = d && d.id ? d : null;
+  const raw = r.data && r.data.pending;
+  // Adapt the real record ({id, tool_name, description, requested_at, expires_at,
+  // decision, decided_by}) to the shape the render layer already expects from the
+  // mock scenarios ({id, tool, effect, args_preview, requested_at}) — the backend
+  // has no notion of "effect" (read/write/exec styling), so it's derived here from
+  // tool_name instead: every gated tool is a vault write except command_execute.
+  const pending = raw ? {
+    id: raw.id,
+    tool: raw.tool_name,
+    effect: raw.tool_name === "mcp__obsidian__command_execute" ? "exec" : "write",
+    args_preview: raw.description || "",
+    requested_at: raw.requested_at
+  } : null;
   if (JSON.stringify(pending) !== JSON.stringify(STATE.approval) || STATE.approvalUnconfirmed) {
     setState({ approval: pending, approvalUnconfirmed: false, approvalErr: null });
   }
@@ -404,11 +417,14 @@ async function submitCmd() {
     setState({ cmdBusy: false, cmdErr: true, cmdMsg: r.err || (r.kind === "timeout" ? "no response" : "refused") });
   } else {
     const d = r.data || {};
+    // The real /command route is synchronous (it returns only once Claude has
+    // fully answered) and has no notion of a turn id — {"response": str} is the
+    // whole body. cmdTurnId stays null; the reply-tag fallback to "reply" (below,
+    // in computeVals) already handles that gracefully.
     setState({
       cmdText: "", cmdBusy: false, cmdErr: false,
-      cmdTurnId: d.turn_id || null,
-      cmdReply: d.reply || null,
-      cmdMsg: d.reply ? "replied" : "running"
+      cmdReply: d.response || null,
+      cmdMsg: d.response ? "replied" : "running"
     });
     poll();
   }

@@ -293,10 +293,28 @@ def test_hook_non_target_tool_returns_empty_without_reading_stdin(tool_name, mon
     assert called == []
 
 
+def _patch_no_claim(monkeypatch):
+    """Isolate the terminal-only path: the HUD channel is unavailable because
+    another confirmation is already pending (claim returns None)."""
+    claims = []
+
+    def fake_claim(tool_name, description, **kwargs):
+        claims.append((tool_name, description, kwargs))
+        return None
+
+    monkeypatch.setattr(permissions.approvals, "claim", fake_claim)
+    cleared = []
+    monkeypatch.setattr(
+        permissions.approvals, "clear", lambda pending_id, **kwargs: cleared.append(pending_id)
+    )
+    return claims, cleared
+
+
 @pytest.mark.parametrize("answer", ["y", "Yes", "YES", " yes ", "yEs"])
 @pytest.mark.parametrize("tool_name", sorted(permissions.CONFIRMATION_REQUIRED_TOOLS))
 def test_hook_target_tool_allows_on_yes_answer(tool_name, answer, monkeypatch, capsys):
     monkeypatch.delenv("JARVIS_SKIP_CONFIRMATION", raising=False)
+    _patch_no_claim(monkeypatch)
 
     async def fake_read(prompt, timeout):
         return answer
@@ -309,13 +327,17 @@ def test_hook_target_tool_allows_on_yes_answer(tool_name, answer, monkeypatch, c
     assert "confirmation required" in out
 
     assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
-    assert result["hookSpecificOutput"]["permissionDecisionReason"] == "Confirmed by human"
+    assert (
+        result["hookSpecificOutput"]["permissionDecisionReason"]
+        == "Confirmed by human via terminal."
+    )
 
 
 @pytest.mark.parametrize("answer", ["n", "no", "NO", "", "maybe", "gibberish"])
 @pytest.mark.parametrize("tool_name", sorted(permissions.CONFIRMATION_REQUIRED_TOOLS))
 def test_hook_target_tool_denies_on_non_yes_answer(tool_name, answer, monkeypatch, capsys):
     monkeypatch.delenv("JARVIS_SKIP_CONFIRMATION", raising=False)
+    _patch_no_claim(monkeypatch)
 
     async def fake_read(prompt, timeout):
         return answer
@@ -326,7 +348,7 @@ def test_hook_target_tool_denies_on_non_yes_answer(tool_name, answer, monkeypatc
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert (
         result["hookSpecificOutput"]["permissionDecisionReason"]
-        == "Declined by human."
+        == "Declined by human via terminal."
     )
 
 
@@ -335,9 +357,12 @@ def test_hook_target_tool_denies_with_timeout_reason_on_none_answer(
     tool_name, monkeypatch
 ):
     monkeypatch.delenv("JARVIS_SKIP_CONFIRMATION", raising=False)
+    _patch_no_claim(monkeypatch)
+    monkeypatch.setattr(permissions, "CONFIRMATION_TIMEOUT_SECONDS", 0.3)
 
     async def fake_read(prompt, timeout):
-        return None  # simulated timeout / no attended terminal
+        await asyncio.sleep(5.0)  # never answers in time
+        return None
 
     monkeypatch.setattr(permissions, "read_line_with_timeout", fake_read)
 
@@ -355,15 +380,17 @@ def test_hook_target_tool_denies_with_timeout_reason_on_none_answer(
     assert (
         "nobody answered" in lowered or "no response" in lowered
     ), f"Reason must explain it was a timeout with no answer: {reason!r}"
+    # Only the terminal was offered on this path.
+    assert "the terminal" in lowered, f"Reason must say the terminal was offered: {reason!r}"
+    assert "the hud" not in lowered, f"Reason must not claim the HUD was offered: {reason!r}"
 
 
-@pytest.mark.parametrize("tool_name", sorted(permissions.CONFIRMATION_REQUIRED_TOOLS))
-def test_hook_target_tool_denies_no_interactive_terminal_when_reader_fails(
-    tool_name, monkeypatch
-):
-    """When stdin can't be registered with the event loop (no real tty attached),
-    the denial reason must explicitly name terminal and rule out Obsidian/API."""
+def test_hook_denies_when_no_terminal_and_no_claim(monkeypatch):
+    """No terminal attached AND the single HUD slot is already taken by another
+    pending confirmation — the old bare NoAttendedTerminalError case, now with a
+    reason that names both failures."""
     monkeypatch.delenv("JARVIS_SKIP_CONFIRMATION", raising=False)
+    _patch_no_claim(monkeypatch)
 
     async def fake_read(prompt, timeout):
         raise permissions.NoAttendedTerminalError(
@@ -372,18 +399,250 @@ def test_hook_target_tool_denies_no_interactive_terminal_when_reader_fails(
 
     monkeypatch.setattr(permissions, "read_line_with_timeout", fake_read)
 
-    result = _hook({"tool_name": tool_name, "tool_input": {"path": "n.md"}})
+    result = _hook({"tool_name": "mcp__obsidian__vault_write", "tool_input": {"path": "n.md"}})
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
     reason = result["hookSpecificOutput"]["permissionDecisionReason"]
     lowered = reason.lower()
-    # Must mention this is *not* Obsidian / API / connectivity, only lacks a terminal.
-    assert any(
-        phrase in lowered for phrase in ("no interactive terminal", "real terminal session")
-    ), f"Reason should mention 'terminal' explicitly: {reason!r}"
+    assert "no interactive terminal" in lowered, f"Must name the missing terminal: {reason!r}"
     assert (
-        # Must rule out the wrong diagnosis from being suggested to Claude
+        "hud approval could not be offered" in lowered
+    ), f"Must explain why no HUD channel existed: {reason!r}"
+    assert (
         "this is not an error with obsidian, its api, or network connectivity" in lowered
     ), f"Reason must rule out Obsidian/API/connectivity: {reason!r}"
+
+
+def test_hook_hud_wins_race_when_no_terminal(monkeypatch):
+    """Terminal unavailable; a HUD claim succeeds and is decided shortly after —
+    the HUD answer must win, and the reason must name the HUD channel."""
+    monkeypatch.delenv("JARVIS_SKIP_CONFIRMATION", raising=False)
+    monkeypatch.setattr(permissions, "CONFIRMATION_TIMEOUT_SECONDS", 5.0)
+
+    state = {"decision": None}
+    cleared = []
+
+    def fake_claim(tool_name, description, **kwargs):
+        return types.SimpleNamespace(id="rid-1")
+
+    def fake_peek(**kwargs):
+        return types.SimpleNamespace(id="rid-1", decision=state["decision"])
+
+    def fake_decide(pending_id, decision, **kwargs):
+        if pending_id == "rid-1" and state["decision"] is None:
+            state["decision"] = decision
+            return True
+        return False
+
+    monkeypatch.setattr(permissions.approvals, "claim", fake_claim)
+    monkeypatch.setattr(permissions.approvals, "peek", fake_peek)
+    monkeypatch.setattr(permissions.approvals, "decide", fake_decide)
+    monkeypatch.setattr(
+        permissions.approvals, "clear", lambda pending_id, **kwargs: cleared.append(pending_id)
+    )
+
+    async def fake_read(prompt, timeout):
+        raise permissions.NoAttendedTerminalError(
+            "stdin is not available for confirmation in this process"
+        )
+
+    monkeypatch.setattr(permissions, "read_line_with_timeout", fake_read)
+
+    async def run():
+        async def hud_answers():
+            await asyncio.sleep(0.3)
+            fake_decide("rid-1", "allow", decided_by="hud")
+
+        task = asyncio.create_task(hud_answers())
+        result = await permissions.pre_tool_use_hook(
+            {"tool_name": "mcp__obsidian__vault_write", "tool_input": {"path": "n.md"}},
+            "tool_1",
+            None,
+        )
+        await task
+        return result
+
+    result = asyncio.run(run())
+    assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert (
+        result["hookSpecificOutput"]["permissionDecisionReason"]
+        == "Confirmed by human via hud."
+    )
+    assert cleared == ["rid-1"]  # claim cleared exactly once after resolution
+
+
+def test_hook_clear_called_once_on_deny_when_claim_succeeded(monkeypatch):
+    monkeypatch.delenv("JARVIS_SKIP_CONFIRMATION", raising=False)
+    monkeypatch.setattr(permissions, "CONFIRMATION_TIMEOUT_SECONDS", 5.0)
+
+    state = {"decision": None}
+    cleared = []
+
+    def fake_claim(tool_name, description, **kwargs):
+        return types.SimpleNamespace(id="rid-2")
+
+    def fake_peek(**kwargs):
+        return types.SimpleNamespace(id="rid-2", decision=state["decision"])
+
+    def fake_decide(pending_id, decision, **kwargs):
+        if pending_id == "rid-2" and state["decision"] is None:
+            state["decision"] = decision
+            return True
+        return False
+
+    monkeypatch.setattr(permissions.approvals, "claim", fake_claim)
+    monkeypatch.setattr(permissions.approvals, "peek", fake_peek)
+    monkeypatch.setattr(permissions.approvals, "decide", fake_decide)
+    monkeypatch.setattr(
+        permissions.approvals, "clear", lambda pending_id, **kwargs: cleared.append(pending_id)
+    )
+
+    async def fake_read(prompt, timeout):
+        raise permissions.NoAttendedTerminalError(
+            "stdin is not available for confirmation in this process"
+        )
+
+    monkeypatch.setattr(permissions, "read_line_with_timeout", fake_read)
+
+    async def run():
+        async def hud_denies():
+            await asyncio.sleep(0.3)
+            fake_decide("rid-2", "deny", decided_by="hud")
+
+        task = asyncio.create_task(hud_denies())
+        result = await permissions.pre_tool_use_hook(
+            {"tool_name": "mcp__obsidian__vault_write", "tool_input": {"path": "n.md"}},
+            "tool_1",
+            None,
+        )
+        await task
+        return result
+
+    result = asyncio.run(run())
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert (
+        result["hookSpecificOutput"]["permissionDecisionReason"]
+        == "Declined by human via hud."
+    )
+    assert cleared == ["rid-2"]
+
+
+def test_hook_claim_called_with_formatted_description(monkeypatch):
+    monkeypatch.delenv("JARVIS_SKIP_CONFIRMATION", raising=False)
+    claims, _ = _patch_no_claim(monkeypatch)
+
+    async def fake_read(prompt, timeout):
+        return "y"
+
+    monkeypatch.setattr(permissions, "read_line_with_timeout", fake_read)
+
+    tool_name = "mcp__obsidian__vault_move"
+    tool_input = {"path": "from.md", "destination": "to.md"}
+    _hook({"tool_name": tool_name, "tool_input": tool_input})
+
+    assert len(claims) == 1
+    claimed_tool, claimed_desc, kwargs = claims[0]
+    assert claimed_tool == tool_name
+    assert claimed_desc == permissions._format_pending_action(tool_name, tool_input)
+    assert kwargs.get("timeout_seconds") == 30.0
+
+
+def test_hook_timeout_when_both_channels_offered_and_neither_answers(monkeypatch):
+    """Terminal attached and a HUD claim succeeded, but nobody answered either —
+    the reason must list both channels that were offered."""
+    monkeypatch.delenv("JARVIS_SKIP_CONFIRMATION", raising=False)
+    monkeypatch.setattr(permissions, "CONFIRMATION_TIMEOUT_SECONDS", 0.4)
+
+    cleared = []
+    monkeypatch.setattr(
+        permissions.approvals,
+        "claim",
+        lambda tool_name, description, **kwargs: types.SimpleNamespace(id="rid-3"),
+    )
+    monkeypatch.setattr(
+        permissions.approvals,
+        "peek",
+        lambda **kwargs: types.SimpleNamespace(id="rid-3", decision=None),
+    )
+    monkeypatch.setattr(
+        permissions.approvals, "clear", lambda pending_id, **kwargs: cleared.append(pending_id)
+    )
+
+    async def fake_read(prompt, timeout):
+        await asyncio.sleep(5.0)  # terminal never answers
+
+    monkeypatch.setattr(permissions, "read_line_with_timeout", fake_read)
+
+    result = _hook({"tool_name": "mcp__obsidian__vault_write", "tool_input": {"path": "n.md"}})
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+    lowered = reason.lower()
+    assert "the terminal" in lowered, f"Must mention the terminal was offered: {reason!r}"
+    assert "the hud" in lowered, f"Must mention the HUD was offered: {reason!r}"
+    assert (
+        "no response was received within 0 seconds on" in lowered
+    ), f"Must carry the timeout wording: {reason!r}"
+    assert cleared == ["rid-3"]
+
+
+def test_hook_hud_wins_and_terminal_task_is_cancelled(monkeypatch):
+    """When the HUD answers first, the losing terminal task must be cancelled —
+    not allowed to complete with a competing decision afterward."""
+    monkeypatch.delenv("JARVIS_SKIP_CONFIRMATION", raising=False)
+    monkeypatch.setattr(permissions, "CONFIRMATION_TIMEOUT_SECONDS", 5.0)
+
+    state = {"decision": None}
+    monkeypatch.setattr(
+        permissions.approvals,
+        "claim",
+        lambda tool_name, description, **kwargs: types.SimpleNamespace(id="rid-4"),
+    )
+    monkeypatch.setattr(
+        permissions.approvals,
+        "peek",
+        lambda **kwargs: types.SimpleNamespace(id="rid-4", decision=state["decision"]),
+    )
+    monkeypatch.setattr(
+        permissions.approvals,
+        "decide",
+        lambda pending_id, decision, **kwargs: state.__setitem__("decision", decision)
+        if pending_id == "rid-4" and state["decision"] is None
+        else False,
+    )
+    monkeypatch.setattr(
+        permissions.approvals, "clear", lambda pending_id, **kwargs: None
+    )
+
+    captured = {}
+
+    async def fake_read(prompt, timeout):
+        captured["task"] = asyncio.current_task()
+        await asyncio.sleep(5.0)
+        return "y"  # would be a competing "allow" if ever consumed
+
+    monkeypatch.setattr(permissions, "read_line_with_timeout", fake_read)
+
+    async def run():
+        async def hud_answers():
+            await asyncio.sleep(0.2)
+            state["decision"] = "allow"
+
+        task = asyncio.create_task(hud_answers())
+        result = await permissions.pre_tool_use_hook(
+            {"tool_name": "mcp__obsidian__vault_write", "tool_input": {"path": "n.md"}},
+            "tool_1",
+            None,
+        )
+        await task
+        return result
+
+    result = asyncio.run(run())
+    assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert (
+        result["hookSpecificOutput"]["permissionDecisionReason"]
+        == "Confirmed by human via hud."
+    )
+    # The losing terminal task was cancelled, not completed with its own answer.
+    assert captured["task"].cancelled() is True
 
 
 def test_read_line_with_timeout_raises_no_attended_terminal_on_oserror(monkeypatch):
@@ -411,17 +670,24 @@ def test_hook_bypass_switch_allows_without_reading_stdin(
     monkeypatch.setenv("JARVIS_SKIP_CONFIRMATION", env_value)
 
     called = []
+    claims = []
 
     async def fake_read(prompt, timeout):
         called.append(prompt)
         return "y"
 
     monkeypatch.setattr(permissions, "read_line_with_timeout", fake_read)
+    monkeypatch.setattr(
+        permissions.approvals,
+        "claim",
+        lambda tool_name, description, **kwargs: claims.append((tool_name, description, kwargs)),
+    )
 
     result = _hook({"tool_name": tool_name, "tool_input": {"path": "n.md"}})
     out = capsys.readouterr().out
 
     assert called == []  # stdin mechanism genuinely never reached
+    assert claims == []  # no HUD claim and no wait happens at all
     assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
     assert (
         result["hookSpecificOutput"]["permissionDecisionReason"]
@@ -434,6 +700,7 @@ def test_hook_bypass_switch_allows_without_reading_stdin(
 @pytest.mark.parametrize("tool_name", ["mcp__obsidian__vault_write"])
 def test_hook_bypass_inactive_values_still_prompt(tool_name, env_value, monkeypatch, capsys):
     monkeypatch.setenv("JARVIS_SKIP_CONFIRMATION", env_value)
+    _patch_no_claim(monkeypatch)
 
     async def fake_read(prompt, timeout):
         return "y"
@@ -446,6 +713,7 @@ def test_hook_bypass_inactive_values_still_prompt(tool_name, env_value, monkeypa
     assert "confirmation required" in out
     assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
     assert (
-        result["hookSpecificOutput"]["permissionDecisionReason"] == "Confirmed by human"
+        result["hookSpecificOutput"]["permissionDecisionReason"]
+        == "Confirmed by human via terminal."
     )
 

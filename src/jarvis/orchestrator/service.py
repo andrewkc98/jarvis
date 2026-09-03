@@ -22,7 +22,16 @@ async def _speak_stream(chunks: AsyncIterator[str], speaker) -> str:
     call in flight never blocks the producer from continuing to drain *chunks*. The
     returned text is the raw concatenation of every chunk received, tracked
     independently of how it was split into spoken sentences.
+
+    speaker=None skips TTS entirely and just concatenates the streamed text — used
+    when the caller doesn't want this turn spoken aloud.
     """
+    if speaker is None:
+        received = []
+        async for chunk in chunks:
+            received.append(chunk)
+        return "".join(received)
+
     buffer = SentenceBuffer()
     queue: asyncio.Queue = asyncio.Queue()
     received: list[str] = []
@@ -80,16 +89,18 @@ class JarvisService:
         self._speaker = Speaker(voice_model_path)
         self._sdk_backend = sdk_backend.SDKBackend()
 
-    async def aanswer(self, text: str, *, stt_ms: float | None = None) -> str:
+    async def aanswer(
+        self, text: str, *, stt_ms: float | None = None, speak: bool = True
+    ) -> str:
         """Answer and speak one turn using the schedule provider or the SDK backend."""
         started = time.monotonic()
         is_schedule = router.route(text) == "schedule"
         path = "schedule" if is_schedule else "sdk"
         try:
             if is_schedule:
-                response, dispatch_ms = await self._dispatch_schedule()
+                response, dispatch_ms = await self._dispatch_schedule(speak=speak)
             else:
-                response, dispatch_ms = await self._dispatch_sdk(text)
+                response, dispatch_ms = await self._dispatch_sdk(text, speak=speak)
         except Exception as exc:
             self._record_failure(path, started, stt_ms, type(exc).__name__)
             raise
@@ -97,15 +108,17 @@ class JarvisService:
         self._record_success(path, started, stt_ms, dispatch_ms)
         return response
 
-    async def _dispatch_schedule(self) -> tuple[str, float]:
+    async def _dispatch_schedule(self, *, speak: bool) -> tuple[str, float]:
         dispatch_start = time.monotonic()
         response = self._answer_schedule()
-        await asyncio.to_thread(self._speaker.say, response)
+        if speak:
+            await asyncio.to_thread(self._speaker.say, response)
         return response, (time.monotonic() - dispatch_start) * 1000
 
-    async def _dispatch_sdk(self, text: str) -> tuple[str, float]:
+    async def _dispatch_sdk(self, text: str, *, speak: bool) -> tuple[str, float]:
         dispatch_start = time.monotonic()
-        response = await _speak_stream(self._sdk_backend.ask_stream(text), self._speaker)
+        speaker = self._speaker if speak else None
+        response = await _speak_stream(self._sdk_backend.ask_stream(text), speaker)
         return response, (time.monotonic() - dispatch_start) * 1000
 
     def _record_success(self, path, started, stt_ms, dispatch_ms) -> None:

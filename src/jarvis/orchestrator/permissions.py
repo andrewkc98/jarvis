@@ -6,6 +6,9 @@ import asyncio
 import os
 import re
 import sys
+import time
+
+from jarvis.approvals import store as approvals
 
 CONFIRMATION_TIMEOUT_SECONDS = 30.0
 
@@ -66,6 +69,40 @@ async def read_line_with_timeout(prompt: str, timeout: float) -> str | None:
         return None
     finally:
         loop.remove_reader(sys.stdin.fileno())
+
+
+async def _wait_terminal(description: str) -> tuple[str, str | None]:
+    """Prompt on this process's terminal, if one is attached. Returns
+    ("terminal", "allow"/"deny"/None) on a real answer or timeout, or
+    ("unavailable", None) immediately if no terminal is attached at all — the
+    caller treats "unavailable" as "this channel doesn't exist", not as an
+    answer, and keeps waiting on whichever other channel is available."""
+    print(f"\n[jarvis] confirmation required:\n  {description}")
+    try:
+        answer = await read_line_with_timeout(
+            "Confirm? [y/N]: ", timeout=CONFIRMATION_TIMEOUT_SECONDS
+        )
+    except NoAttendedTerminalError:
+        return ("unavailable", None)
+    if answer is not None and answer.strip().lower() in ("y", "yes"):
+        return ("terminal", "allow")
+    if answer is not None:
+        return ("terminal", "deny")
+    return ("terminal", None)
+
+
+async def _wait_hud(pending_id: str, deadline: float) -> tuple[str, str | None]:
+    """Poll the Task 13 pending-approval file until it's decided or `deadline`
+    (a time.monotonic() timestamp) passes. Returns ("hud", "allow"/"deny") or
+    ("hud", None) on its own timeout."""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return ("hud", None)
+        record = approvals.peek()
+        if record is not None and record.id == pending_id and record.decision is not None:
+            return ("hud", record.decision)
+        await asyncio.sleep(min(0.25, remaining))
 
 
 def _sanitize_preview(text: str) -> str:
@@ -137,47 +174,89 @@ async def pre_tool_use_hook(input_data, tool_use_id, context):
 
     tool_input = input_data.get("tool_input", {})
     description = _format_pending_action(tool_name, tool_input)
+    claimed = approvals.claim(
+        tool_name, description, timeout_seconds=CONFIRMATION_TIMEOUT_SECONDS
+    )
+    deadline = time.monotonic() + CONFIRMATION_TIMEOUT_SECONDS
 
-    try:
-        async with _confirmation_lock:
-            print(f"\n[jarvis] confirmation required:\n  {description}")
-            answer = await read_line_with_timeout(
-                "Confirm? [y/N]: ", timeout=CONFIRMATION_TIMEOUT_SECONDS
+    async with _confirmation_lock:
+        tasks = [asyncio.create_task(_wait_terminal(description))]
+        if claimed is not None:
+            tasks.append(asyncio.create_task(_wait_hud(claimed.id, deadline)))
+
+        terminal_available = True
+        channel: str | None = None
+        decision: str | None = None
+        pending = set(tasks)
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            done, pending = await asyncio.wait(
+                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
             )
-    except NoAttendedTerminalError:
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": (
-                    "No interactive terminal is available to confirm this action. "
-                    "This process needs to be running attended, in a real terminal "
-                    "session, for vault-mutating requests. This is not an error with "
-                    "Obsidian, its API, or network connectivity."
-                ),
-            }
-        }
+            for task in done:
+                source, answer = task.result()
+                if source == "unavailable":
+                    terminal_available = False
+                    continue
+                if answer is not None:
+                    channel, decision = source, answer
+            if decision is not None:
+                break
 
-    if answer is not None and answer.strip().lower() in ("y", "yes"):
+        for task in pending:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    if claimed is not None:
+        approvals.clear(claimed.id)
+
+    if decision == "allow":
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "allow",
-                "permissionDecisionReason": "Confirmed by human",
+                "permissionDecisionReason": f"Confirmed by human via {channel}.",
+            }
+        }
+    if decision == "deny":
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": f"Declined by human via {channel}.",
             }
         }
 
-    if answer is None:
+    if not terminal_available and claimed is None:
         reason = (
-            f"No response was received within {CONFIRMATION_TIMEOUT_SECONDS:.0f} "
-            "seconds. This write was denied by default for safety and was never "
-            "attempted — this is not an error with Obsidian, its API, or network "
-            "connectivity; it means nobody answered the confirmation prompt in time. "
-            "If the human wants this to happen, ask again and explicitly respond to "
-            "the terminal confirmation."
+            "No interactive terminal is available to confirm this action, and a "
+            "HUD approval could not be offered because another confirmation was "
+            "already pending. This process needs to be running attended — in a "
+            "real terminal session or with the HUD open — for vault-mutating "
+            "requests. This is not an error with Obsidian, its API, or network "
+            "connectivity."
         )
     else:
-        reason = "Declined by human."
+        channels = []
+        if terminal_available:
+            channels.append("the terminal")
+        if claimed is not None:
+            channels.append("the HUD")
+        offered = " and ".join(channels)
+        reason = (
+            f"No response was received within {CONFIRMATION_TIMEOUT_SECONDS:.0f} "
+            f"seconds on {offered}, so this write was denied by default for "
+            "safety and was never attempted. This is not an error with Obsidian, "
+            "its API, or network connectivity — it means nobody answered the "
+            "confirmation prompt in time. If the human wants this to happen, ask "
+            "again and explicitly respond to the confirmation."
+        )
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",

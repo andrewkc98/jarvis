@@ -31,6 +31,9 @@ API_PORT = _load_api_port()
 HUD_ORIGIN = os.environ.get("HUD_ORIGIN") or None
 TELEMETRY_PATH = Path(__file__).resolve().parents[2] / "telemetry.jsonl"
 TELEMETRY_LOCK_PATH = TELEMETRY_PATH.with_suffix(".jsonl.lock")
+PENDING_APPROVAL_PATH = Path(__file__).resolve().parents[2] / "pending_approval.json"
+PENDING_APPROVAL_LOCK_PATH = PENDING_APPROVAL_PATH.with_suffix(".json.lock")
+VOICE_MODEL_PATH = os.environ.get("JARVIS_VOICE_MODEL") or None
 
 
 def get_credential(name: str) -> str:

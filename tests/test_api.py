@@ -2,8 +2,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from jarvis import config, telemetry
-from jarvis.api import launcher
+from jarvis.api import launcher, main as api_main
 from jarvis.api.main import app as the_app, build_app
+from jarvis.approvals.store import PendingApproval
 from jarvis.providers import schedule_provider, vault_provider
 from jarvis.telemetry import store
 from jarvis.tools import vitals
@@ -191,3 +192,286 @@ def test_launcher_main_calls_uvicorn(monkeypatch):
     from jarvis.api.main import app as the_app
 
     assert called["app"] is the_app
+
+
+def _pending_record(decision=None):
+    return PendingApproval(
+        id="abc123",
+        tool_name="obsidian_write",
+        description="Write a note",
+        requested_at="2026-09-03T10:00:00Z",
+        expires_at="2026-09-03T10:30:00Z",
+        decision=decision,
+        decided_by="hud" if decision is not None else None,
+    )
+
+
+@pytest.fixture
+def reset_service_singleton(monkeypatch):
+    monkeypatch.setattr(api_main, "_service", None, raising=True)
+    return monkeypatch
+
+
+def test_pending_approval_none(monkeypatch, reset_service_singleton):
+    monkeypatch.setattr(api_main.approvals, "peek", lambda: None)
+    client = TestClient(build_app())
+    response = client.get("/pending-approval")
+    assert response.status_code == 200
+    assert response.json() == {"pending": None}
+
+
+def test_pending_approval_decided_but_not_cleared(monkeypatch, reset_service_singleton):
+    monkeypatch.setattr(
+        api_main.approvals, "peek", lambda: _pending_record(decision="allow")
+    )
+    client = TestClient(build_app())
+    response = client.get("/pending-approval")
+    assert response.status_code == 200
+    assert response.json() == {"pending": None}
+
+
+def test_pending_approval_undecided(monkeypatch, reset_service_singleton):
+    record = _pending_record()
+    monkeypatch.setattr(api_main.approvals, "peek", lambda: record)
+    client = TestClient(build_app())
+    response = client.get("/pending-approval")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pending"] == {
+        "id": "abc123",
+        "tool_name": "obsidian_write",
+        "description": "Write a note",
+        "requested_at": "2026-09-03T10:00:00Z",
+        "expires_at": "2026-09-03T10:30:00Z",
+        "decision": None,
+        "decided_by": None,
+    }
+
+
+def test_allow_success(monkeypatch, reset_service_singleton):
+    def fake_decide(pending_id, decision, *, decided_by, **kwargs):
+        fake_decide.calls.append((pending_id, decision, decided_by))
+        return True
+
+    fake_decide.calls = []
+    monkeypatch.setattr(api_main.approvals, "decide", fake_decide)
+    client = TestClient(build_app())
+    response = client.post("/allow", json={"id": "abc123"})
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert fake_decide.calls == [("abc123", "allow", "hud")]
+
+
+def test_deny_success(monkeypatch, reset_service_singleton):
+    def fake_decide(pending_id, decision, *, decided_by, **kwargs):
+        fake_decide.calls.append((pending_id, decision, decided_by))
+        return True
+
+    fake_decide.calls = []
+    monkeypatch.setattr(api_main.approvals, "decide", fake_decide)
+    client = TestClient(build_app())
+    response = client.post("/deny", json={"id": "abc123"})
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert fake_decide.calls == [("abc123", "deny", "hud")]
+
+
+@pytest.mark.parametrize("path", ["/allow", "/deny"])
+def test_decision_rejected_returns_409(monkeypatch, reset_service_singleton, path):
+    monkeypatch.setattr(api_main.approvals, "decide", lambda *a, **k: False)
+    client = TestClient(build_app())
+    response = client.post(path, json={"id": "abc123"})
+    assert response.status_code == 409
+    assert response.json() == {"error": "expired_or_mismatched"}
+
+
+def test_allow_without_id_does_not_call_decide(
+    monkeypatch, reset_service_singleton
+):
+    def explode(*a, **k):
+        raise AssertionError("approvals.decide should not be called")
+
+    monkeypatch.setattr(api_main.approvals, "decide", explode)
+    client = TestClient(build_app())
+    response = client.post("/allow", json={})
+    assert response.status_code == 409
+    assert response.json() == {"error": "expired_or_mismatched"}
+    response = client.post("/allow", json={"id": ""})
+    assert response.status_code == 409
+    assert response.json() == {"error": "expired_or_mismatched"}
+
+
+def test_command_success_and_speak_default(monkeypatch, reset_service_singleton):
+    monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
+
+    class FakeService:
+        def __init__(self, voice_model_path):
+            FakeService.constructed += 1
+
+        async def aanswer(self, text, *, speak=True, **kwargs):
+            FakeService.calls.append((text, speak))
+            return "done"
+
+        async def aclose(self):
+            FakeService.aclose_calls += 1
+
+    FakeService.constructed = 0
+    FakeService.calls = []
+    FakeService.aclose_calls = 0
+    monkeypatch.setattr(api_main, "JarvisService", FakeService)
+
+    client = TestClient(build_app())
+    response = client.post("/command", json={"text": "hello"})
+    assert response.status_code == 200
+    assert response.json() == {"response": "done"}
+    assert FakeService.calls == [("hello", True)]
+
+
+def test_command_explicit_speak_false(monkeypatch, reset_service_singleton):
+    monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
+
+    class FakeService:
+        def __init__(self, voice_model_path):
+            pass
+
+        async def aanswer(self, text, *, speak=True, **kwargs):
+            FakeService.speak = speak
+            return "ok"
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(api_main, "JarvisService", FakeService)
+    client = TestClient(build_app())
+    response = client.post("/command", json={"text": "hi", "speak": False})
+    assert response.status_code == 200
+    assert FakeService.speak is False
+
+
+def test_command_reuses_single_service_instance(
+    monkeypatch, reset_service_singleton
+):
+    monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
+    constructed = []
+
+    class FakeService:
+        def __init__(self, voice_model_path):
+            constructed.append(voice_model_path)
+
+        async def aanswer(self, text, *, speak=True, **kwargs):
+            return f"answered:{text}"
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(api_main, "JarvisService", FakeService)
+    client = TestClient(build_app())
+    assert client.post("/command", json={"text": "one"}).json() == {
+        "response": "answered:one"
+    }
+    assert client.post("/command", json={"text": "two"}).json() == {
+        "response": "answered:two"
+    }
+    assert len(constructed) == 1
+    assert constructed == ["/tmp/voice.onnx"]
+
+
+def test_command_missing_text(monkeypatch, reset_service_singleton):
+    monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
+
+    class FakeService:
+        def __init__(self, voice_model_path):
+            raise AssertionError("should not construct service for bad request")
+
+        async def aanswer(self, text, *, speak=True):
+            raise AssertionError("unreachable")
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(api_main, "JarvisService", FakeService)
+    client = TestClient(build_app())
+    for body in [{}, {"text": ""}]:
+        response = client.post("/command", json=body)
+        assert response.status_code == 422
+        assert response.json() == {"error": "text is required"}
+    assert api_main._service is None
+
+
+def test_command_voice_model_not_configured(monkeypatch, reset_service_singleton):
+    monkeypatch.setattr(config, "VOICE_MODEL_PATH", None, raising=True)
+    constructed = []
+
+    class FakeService:
+        def __init__(self, voice_model_path):
+            constructed.append(voice_model_path)
+
+        async def aanswer(self, text, *, speak=True):
+            raise AssertionError("unreachable")
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(api_main, "JarvisService", FakeService)
+    client = TestClient(build_app())
+    response = client.post("/command", json={"text": "hello"})
+    assert response.status_code == 503
+    assert response.json() == {"error": "voice_model_not_configured"}
+    assert constructed == []
+    assert api_main._service is None
+
+
+def test_command_aanswer_raises_returns_502(monkeypatch, reset_service_singleton):
+    monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
+
+    class FakeService:
+        async def aanswer(self, text, *, speak=True, **kwargs):
+            raise RuntimeError("piper exploded")
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(api_main, "JarvisService", FakeService)
+    client = TestClient(build_app())
+    response = client.post("/command", json={"text": "hello"})
+    assert response.status_code == 502
+    assert response.json() == {"error": "command_failed"}
+
+
+def test_client_shutdown_closes_service(monkeypatch, reset_service_singleton):
+    monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
+    aclose_calls = []
+
+    class FakeService:
+        def __init__(self, voice_model_path):
+            pass
+
+        async def aanswer(self, text, *, speak=True, **kwargs):
+            return "ok"
+
+        async def aclose(self):
+            aclose_calls.append(True)
+
+    monkeypatch.setattr(api_main, "JarvisService", FakeService)
+    with TestClient(build_app()) as client:
+        assert client.post("/command", json={"text": "hello"}).status_code == 200
+    assert aclose_calls == [True]
+
+
+def test_client_shutdown_without_service_does_not_call_aclose(
+    monkeypatch, reset_service_singleton
+):
+    monkeypatch.setattr(config, "VOICE_MODEL_PATH", "/tmp/voice.onnx", raising=True)
+    aclose_calls = []
+
+    class FakeService:
+        def __init__(self, voice_model_path):
+            pass
+
+        async def aclose(self):
+            aclose_calls.append(True)
+
+    monkeypatch.setattr(api_main, "JarvisService", FakeService)
+    with TestClient(build_app()) as client:
+        assert client.get("/vitals").status_code == 200
+    assert aclose_calls == []

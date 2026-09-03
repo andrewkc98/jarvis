@@ -18,6 +18,7 @@ pip install -e ".[dev]"
 - Optionally set `OBSIDIAN_REST_BASE_URL` to override the default `https://localhost:27124`.
 - `JARVIS_API_PORT` — port the local data API listens on. Defaults to `8765`. Must be a valid integer; if it is not, the process fails to start with a clear error message.
 - `HUD_ORIGIN` — the origin (scheme + host + port, e.g. `http://localhost:3000`) of the HUD web frontend that is allowed to call the API cross-origin. Unset by default; when unset the API has no cross-origin access at all. Set it to the HUD's actual origin to enable cross-origin requests.
+- `JARVIS_VOICE_MODEL` — path to the Piper `.onnx` voice model the API process uses for `/command`. Unset by default; `/command` returns `503` with `{"error": "voice_model_not_configured"}` until it is set.
 
 For more detail, see [`docs/mcp-inventory.md`](docs/mcp-inventory.md) and [`docs/threat-model.md`](docs/threat-model.md).
 
@@ -72,6 +73,25 @@ curl localhost:8765/vault-summary
 curl localhost:8765/telemetry
 ```
 
+### Approval and command endpoints
+
+Beyond the read-only data endpoints above, the API also exposes a small approval and
+command surface for the HUD:
+
+- `GET /pending-approval` — returns whatever is currently awaiting confirmation, if
+  anything (the vault-mutating action that's paused on a yes/no answer), or empty when
+  nothing is pending.
+- `POST /allow` and `POST /deny` — body `{"id": ...}`. Together they answer a pending
+  confirmation from the HUD instead of the terminal, using the `id` from
+  `GET /pending-approval`.
+- `POST /command` — body `{"text": ..., "speak": true|false}`. Runs a typed request
+  through the same pipeline as a spoken one; `speak` controls whether the machine says
+  the answer out loud (default `true`).
+
+One known limitation: a command typed into the HUD and a voice session in the CLI are
+separate conversations with no shared history — they are different processes, not two
+windows onto the same session.
+
 ### Telemetry
 
 Each completed interaction appends a line to `telemetry.jsonl` at the repository root.
@@ -80,3 +100,9 @@ first.
 
 Each entry records pipeline timing (how long each stage took) and which tools fired. It
 does **not** record prompts, responses, or any vault/calendar content.
+
+### Pending approval file
+
+`pending_approval.json` lives at the repository root (also gitignored). Unlike
+`telemetry.jsonl`, it holds at most one record at a time and is deleted once the pending
+confirmation is answered — it is not a log.

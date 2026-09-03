@@ -397,3 +397,89 @@ def test_arun_once_passes_stt_ms_while_arun_text_does_not(monkeypatch):
     asyncio.run(JarvisService("voice.onnx").arun_text("hello"))
     assert captured["stt_ms"] is None
 
+
+def test_aanswer_speak_false_on_schedule_branch_does_not_speak(monkeypatch):
+    monkeypatch.setattr(
+        schedule_provider, "get_upcoming_events", Mock(return_value=[{"title": "X"}])
+    )
+    monkeypatch.setattr(router, "route", lambda text: "schedule")
+    speak_mock = Mock()
+    monkeypatch.setattr(tts.Speaker, "say", lambda self, text: speak_mock(text))
+
+    silent = asyncio.run(
+        JarvisService("voice.onnx").aanswer("what is on my calendar", speak=False)
+    )
+    spoken = asyncio.run(
+        JarvisService("voice.onnx").aanswer("what is on my calendar", speak=True)
+    )
+
+    assert silent == "You have 1 events: X"
+    assert speak_mock.call_count == 1
+    speak_mock.assert_called_once_with(spoken)
+    assert silent == spoken
+
+
+def test_aanswer_speak_false_on_sdk_branch_does_not_speak(monkeypatch):
+    monkeypatch.setattr(router, "route", lambda text: "fallback")
+    speak_mock = Mock()
+    monkeypatch.setattr(tts.Speaker, "say", lambda self, text: speak_mock(text))
+    monkeypatch.setattr(
+        sdk_backend.SDKBackend, "ask_stream",
+        lambda self, prompt: _fake_ask_stream(["The vault "]),
+    )
+
+    silent = asyncio.run(
+        JarvisService("voice.onnx").aanswer("what did I write?", speak=False)
+    )
+    # Spoken control: same input with default/True must still speak.
+    asyncio.run(
+        JarvisService("voice.onnx").aanswer("what did I write?", speak=True)
+    )
+
+    assert silent == "The vault "
+    assert speak_mock.call_count == 1
+
+
+def test_telemetry_shape_is_independent_of_speak_schedule(monkeypatch):
+    for speak in (True, False):
+        monkeypatch.setattr(
+            schedule_provider, "get_upcoming_events",
+            Mock(return_value=[{"title": "X"}]),
+        )
+        monkeypatch.setattr(router, "route", lambda text: "schedule")
+        monkeypatch.setattr(tts.Speaker, "say", lambda self, text: None)
+        telemetry_mock = Mock()
+        monkeypatch.setattr(telemetry_store, "append_entry", telemetry_mock.append_entry)
+
+        asyncio.run(JarvisService("voice.onnx").aanswer("cal", speak=speak))
+
+        entry = _entry(telemetry_mock)
+        assert entry.path == "schedule"
+        assert entry.tools_fired == []
+        assert entry.error is None
+        assert entry.duration_ms >= 0
+        assert entry.stt_ms is None
+
+
+def test_telemetry_shape_is_independent_of_speak_sdk(monkeypatch):
+    shapes = []
+    for speak in (True, False):
+        monkeypatch.setattr(router, "route", lambda text: "fallback")
+        monkeypatch.setattr(tts.Speaker, "say", lambda self, text: None)
+        monkeypatch.setattr(
+            sdk_backend.SDKBackend, "ask_stream",
+            lambda self, prompt: _fake_ask_stream(["ok"]),
+        )
+        telemetry_mock = Mock()
+        monkeypatch.setattr(telemetry_store, "append_entry", telemetry_mock.append_entry)
+
+        service = JarvisService("voice.onnx")
+        service._sdk_backend.last_tools_fired = ["mcp__vault__read"]
+        asyncio.run(service.aanswer("q", speak=speak))
+
+        entry = _entry(telemetry_mock)
+        shapes.append((entry.path, entry.tools_fired, entry.error))
+
+    assert shapes[0] == ("sdk", ["mcp__vault__read"], None)
+    assert shapes[1] == shapes[0]
+
