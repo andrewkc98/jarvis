@@ -6,7 +6,11 @@ import httpx
 import pytest
 
 from jarvis.providers.schedule_provider import get_upcoming_events
-from jarvis.providers.vault_provider import get_daily_note, get_open_task_count
+from jarvis.providers.vault_provider import (
+    get_daily_note,
+    get_daily_note_and_task_count,
+    get_open_task_count,
+)
 
 
 def _event(title: str, start: datetime, end: datetime) -> SimpleNamespace:
@@ -248,3 +252,60 @@ def test_get_daily_note_propagates_non_404_http_errors():
         }[name]
         with pytest.raises(httpx.HTTPStatusError):
             get_daily_note()
+
+
+def test_get_daily_note_and_task_count_issues_single_request():
+    note = "# Today\n- [ ] One open\n- [ ] Two open\n- [x] Checked one\n- Done\n"
+    client, response = _httpx_client(note)
+    with (
+        patch("jarvis.providers.vault_provider.get_credential") as credential,
+        patch("jarvis.providers.vault_provider.httpx.Client", return_value=client),
+    ):
+        credential.side_effect = lambda name: {
+            "OBSIDIAN_REST_BASE_URL": "https://vault.example",
+            "OBSIDIAN_REST_TOKEN": "test-token",
+        }[name]
+        content, count = get_daily_note_and_task_count()
+
+    assert content == note
+    assert count == 2  # two "- [ ]" lines; checked and non-checklist lines excluded
+    client.get.assert_called_once_with("/periodic/daily/")
+
+
+def test_get_daily_note_and_task_count_zero_for_missing_note():
+    response = _response(404, {"errorCode": 40461, "message": "missing"})
+    client = MagicMock()
+    client.get.return_value = response
+    client.__enter__.return_value = client
+    with (
+        patch("jarvis.providers.vault_provider.get_credential") as credential,
+        patch("jarvis.providers.vault_provider.httpx.Client", return_value=client),
+    ):
+        credential.side_effect = lambda name: {
+            "OBSIDIAN_REST_BASE_URL": "https://vault.example",
+            "OBSIDIAN_REST_TOKEN": "test-token",
+        }[name]
+        assert get_daily_note_and_task_count() == ("", 0)
+    response.raise_for_status.assert_not_called()
+    client.get.assert_called_once_with("/periodic/daily/")
+
+
+def test_get_daily_note_and_task_count_propagates_http_errors():
+    response = _response(500)
+    response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "500", request=MagicMock(), response=response
+    )
+    client = MagicMock()
+    client.get.return_value = response
+    client.__enter__.return_value = client
+    with (
+        patch("jarvis.providers.vault_provider.get_credential") as credential,
+        patch("jarvis.providers.vault_provider.httpx.Client", return_value=client),
+    ):
+        credential.side_effect = lambda name: {
+            "OBSIDIAN_REST_BASE_URL": "https://vault.example",
+            "OBSIDIAN_REST_TOKEN": "test-token",
+        }[name]
+        with pytest.raises(httpx.HTTPStatusError):
+            get_daily_note_and_task_count()
+

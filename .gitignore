@@ -9,3 +9,5 @@ node_modules/
 *.onnx.json
 mcp-config.json
 .env
+telemetry.jsonl
+telemetry.jsonl.lock

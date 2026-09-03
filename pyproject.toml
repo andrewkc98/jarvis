@@ -15,6 +15,9 @@ dependencies = [
     "keyring",
     "pyobjc-framework-EventKit",
     "claude-agent-sdk==0.2.151",
+    "fastapi==0.141.1",
+    "uvicorn==0.52.4",
+    "psutil==7.2.2",
 ]
 
 [project.optional-dependencies]

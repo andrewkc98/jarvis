@@ -7,6 +7,7 @@ import numpy as np
 from jarvis.orchestrator.service import JarvisService, _speak_stream
 from jarvis.orchestrator import router, sdk_backend
 from jarvis.providers import schedule_provider
+from jarvis.telemetry import store as telemetry_store
 from jarvis.voice import capture, stt, tts
 
 
@@ -247,3 +248,152 @@ def test_aclose_closes_sdk_backend(monkeypatch):
     service = JarvisService("voice.onnx")
     asyncio.run(service.aclose())
     close_mock.assert_called_once_with()
+
+
+def _entry(telemetry_mock):
+    assert telemetry_mock.append_entry.call_count == 1
+    return telemetry_mock.append_entry.call_args.args[0]
+
+
+def _raising_stream(message):
+    async def _gen():
+        raise ConnectionError(message)
+        yield  # pragma: no cover - make this an async generator
+
+    return _gen()
+
+
+def test_telemetry_schedule_branch_appends_success(monkeypatch):
+    monkeypatch.setattr(schedule_provider, "get_upcoming_events", Mock(return_value=[{"title": "X"}]))
+    monkeypatch.setattr(router, "route", lambda text: "schedule")
+    monkeypatch.setattr(tts.Speaker, "say", lambda self, text: None)
+    telemetry_mock = Mock()
+    monkeypatch.setattr(telemetry_store, "append_entry", telemetry_mock.append_entry)
+
+    result = asyncio.run(JarvisService("voice.onnx").arun_text("what is on my calendar"))
+
+    entry = _entry(telemetry_mock)
+    assert result == "You have 1 events: X"
+    assert entry.path == "schedule"
+    assert entry.tools_fired == []
+    assert entry.error is None
+    assert entry.duration_ms >= 0
+    assert entry.stt_ms is None
+
+
+def test_telemetry_sdk_branch_appends_tools_fired(monkeypatch):
+    monkeypatch.setattr(router, "route", lambda text: "fallback")
+    monkeypatch.setattr(tts.Speaker, "say", lambda self, text: None)
+    monkeypatch.setattr(
+        sdk_backend.SDKBackend, "ask_stream",
+        lambda self, prompt: _fake_ask_stream(["The vault says hello."]),
+    )
+    telemetry_mock = Mock()
+    monkeypatch.setattr(telemetry_store, "append_entry", telemetry_mock.append_entry)
+
+    service = JarvisService("voice.onnx")
+    # Simulate the tools the stream would have recorded, so the entry reflects them.
+    service._sdk_backend.last_tools_fired = ["mcp__vault__read", "mcp__vault__write"]
+    asyncio.run(service.arun_text("what did I write?"))
+
+    entry = _entry(telemetry_mock)
+    assert entry.path == "sdk"
+    assert entry.tools_fired == ["mcp__vault__read", "mcp__vault__write"]
+    assert entry.error is None
+
+
+def test_telemetry_sdk_branch_failure_records_class_name_and_propagates(monkeypatch):
+    monkeypatch.setattr(router, "route", lambda text: "fallback")
+    monkeypatch.setattr(tts.Speaker, "say", lambda self, text: None)
+    monkeypatch.setattr(
+        sdk_backend.SDKBackend,
+        "ask_stream",
+        lambda self, prompt: _raising_stream("the vault secret S3CR3T was exposed"),
+    )
+    telemetry_mock = Mock()
+    monkeypatch.setattr(telemetry_store, "append_entry", telemetry_mock.append_entry)
+
+    service = JarvisService("voice.onnx")
+    # Simulate the tool the stream would have recorded before it failed.
+    service._sdk_backend.last_tools_fired = ["mcp__vault__read"]
+    try:
+        asyncio.run(service.arun_text("what did I write?"))
+    except ConnectionError as error:
+        assert "S3CR3T" in str(error)
+    else:
+        raise AssertionError("expected ConnectionError to propagate")
+
+    entry = _entry(telemetry_mock)
+    assert entry.path == "sdk"
+    assert entry.error == "ConnectionError"
+    # Only the class name is recorded, never the exception message.
+    assert "S3CR3T" not in str(entry.error)
+
+
+def test_telemetry_failure_never_swallows_original_exception(monkeypatch, capsys):
+    monkeypatch.setattr(router, "route", lambda text: "fallback")
+    monkeypatch.setattr(tts.Speaker, "say", lambda self, text: None)
+    monkeypatch.setattr(
+        sdk_backend.SDKBackend,
+        "ask_stream",
+        lambda self, prompt: _raising_stream("boom"),
+    )
+
+    # Telemetry itself also raises: the turn's real error must still surface unchanged.
+    def poisoned_append(entry, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(telemetry_store, "append_entry", poisoned_append)
+
+    service = JarvisService("voice.onnx")
+    try:
+        asyncio.run(service.arun_text("what did I write?"))
+    except ConnectionError as error:
+        assert "boom" in str(error)
+    except OSError:
+        raise AssertionError("telemetry failure must not replace the original exception")
+    else:
+        raise AssertionError("expected ConnectionError to propagate")
+
+    assert "telemetry write failed" in capsys.readouterr().err
+
+
+def test_telemetry_failure_does_not_break_successful_turn(monkeypatch, capsys):
+    monkeypatch.setattr(schedule_provider, "get_upcoming_events", Mock(return_value=[{"title": "Standup"}]))
+    monkeypatch.setattr(router, "route", lambda text: "schedule")
+    monkeypatch.setattr(tts.Speaker, "say", lambda self, text: None)
+
+    def poisoned_append(entry, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(telemetry_store, "append_entry", poisoned_append)
+
+    result = asyncio.run(JarvisService("voice.onnx").arun_text("what is on my calendar"))
+
+    assert result == "You have 1 events: Standup"
+    assert "telemetry write failed" in capsys.readouterr().err
+
+
+def test_arun_once_passes_stt_ms_while_arun_text_does_not(monkeypatch):
+    captured = {}
+
+    async def record_answer(self, text, *, stt_ms=None):
+        captured["stt_ms"] = stt_ms
+        return "ok"
+
+    monkeypatch.setattr(JarvisService, "aanswer", record_answer)
+
+    # arun_once: stt_ms must be a concrete (non-None) measurement.
+    monkeypatch.setattr(
+        capture, "record_on_enter",
+        Mock(return_value=np.array([0.0], dtype=np.float32)),
+    )
+    monkeypatch.setattr(stt, "transcribe", Mock(return_value="hello"))
+    asyncio.run(JarvisService("voice.onnx").arun_once())
+    assert captured["stt_ms"] is not None
+    assert captured["stt_ms"] >= 0
+
+    # arun_text: stt_ms must default to None.
+    asyncio.run(JarvisService("voice.onnx").arun_text("hello"))
+    assert captured["stt_ms"] is None
+

@@ -11,6 +11,27 @@ import keyring
 
 MCP_CONFIG_PATH = Path(__file__).resolve().parents[2] / "mcp-config.json"
 
+API_PORT_ENV_VAR = "JARVIS_API_PORT"
+_DEFAULT_API_PORT = 8765
+
+
+def _load_api_port() -> int:
+    raw = os.environ.get(API_PORT_ENV_VAR)
+    if raw is None:
+        return _DEFAULT_API_PORT
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{API_PORT_ENV_VAR}={raw!r} is not a valid integer port"
+        ) from exc
+
+
+API_PORT = _load_api_port()
+HUD_ORIGIN = os.environ.get("HUD_ORIGIN") or None
+TELEMETRY_PATH = Path(__file__).resolve().parents[2] / "telemetry.jsonl"
+TELEMETRY_LOCK_PATH = TELEMETRY_PATH.with_suffix(".jsonl.lock")
+
 
 def get_credential(name: str) -> str:
     """Return a credential from the environment or the macOS Keychain."""

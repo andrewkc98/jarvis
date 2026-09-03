@@ -59,3 +59,14 @@ def get_daily_note() -> str:
 def get_open_task_count() -> int:
     """Count unchecked Markdown task-list items in today's daily note."""
     return sum(line.startswith("- [ ]") for line in get_daily_note().splitlines())
+
+
+def _count_open_tasks(content: str) -> int:
+    """Count unchecked Markdown task-list items in the given note content."""
+    return sum(line.startswith("- [ ]") for line in content.splitlines())
+
+
+def get_daily_note_and_task_count() -> tuple[str, int]:
+    """Fetch today's daily note exactly once; return (content, open_task_count)."""
+    content = _fetch_daily_note()
+    return content, _count_open_tasks(content)

@@ -127,14 +127,21 @@ If one is added later, it re-enters this table and §6 below at that time, not b
 
 ## 6. Actions requiring explicit confirmation before executing
 
-This is the authoritative list. Phase 3's `can_use_tool` callback (in
-`orchestrator/sdk_backend.py`, checking `config.py`'s `confirmation_required_tools` list)
-must implement exactly this set — if Phase 3 needs to add a capability not listed here,
-this document is updated first, the callback second, not the other way around. Per
-`.agent/PLAN.md`'s three-tier permission policy: anything not in `allowed_tools` and not
-in this confirmation list is denied outright, with no prompt at all — this list is not
-"everything that isn't pre-approved," it is specifically the tools that get an
-interactive confirmation rather than a silent deny.
+This is the authoritative list. **Mechanism corrected 2026-09-02** (Codex's plan review
+found the original `can_use_tool`/`permission_mode="default"` design doesn't
+unconditionally gate every call — `can_use_tool` is skipped for calls already resolved
+elsewhere): Phase 3's real mechanism is a `PreToolUse` hook
+(`orchestrator/permissions.py`'s `pre_tool_use_hook`, registered on `sdk_backend.py`'s
+`ClaudeAgentOptions.hooks`), which fires before every other permission-evaluation step
+regardless of mode. `permission_mode` stays `bypassPermissions`, unchanged from Phase 2 —
+this is not a return to an allow-list or a default-deny posture. The hook checks
+`CONFIRMATION_REQUIRED_TOOLS` (exactly the 7 tools listed below) and only intervenes for
+those; every other tool call — every other Obsidian tool, every ambient MCP connector,
+every built-in tool — passes through with an empty hook response and the unchanged
+full-capability posture, no prompt, no added latency. An environment variable,
+`JARVIS_SKIP_CONFIRMATION`, lets the human disable even this narrow gate on demand ("if I
+need something done fast... not ask me for every prompt") — when set, the 7 tools
+auto-approve with a visible bypass notice printed instead of a prompt, never silently.
 
 **Requires confirmation:**
 - Any vault write: create, edit, delete, move, or rename a note or file, via MCP.
@@ -275,9 +282,19 @@ Revisit this document, don't just append to it, when any of the following happen
 - Phase 1b's repair pass (dropping tool isolation, fixing the `cli_backend.py` `cwd` bug)
   is complete (confirm this document's description of the running design matches the
   actual repaired code).
-- Phase 3 is planned or implemented — this is now the point where the confirmation-gate
-  question must be explicitly re-decided (keep it, given "no neutered assistant"? apply
-  it only to writes, not all tools? drop it too?), not assumed from §6 as written.
+- **Phase 3 decided, 2026-09-02, mechanism corrected same day after plan review:** narrow
+  confirmation gate, not a return to general restriction. `orchestrator/permissions.py`'s
+  `CONFIRMATION_REQUIRED_TOOLS` covers exactly the 7 mutating Obsidian tools
+  (`vault_append`, `vault_copy`, `vault_delete`, `vault_move`, `vault_patch`,
+  `vault_write`, `command_execute`, all `mcp__obsidian__`-qualified), enforced via a
+  `PreToolUse` hook — **not** `permission_mode="default"` + `can_use_tool` (that design
+  was found not to unconditionally gate every call and was withdrawn; `permission_mode`
+  stays `bypassPermissions`, unchanged from Phase 2). Everything outside those 7 tools is
+  unaffected, still auto-approved, no prompt. A `JARVIS_SKIP_CONFIRMATION` env var lets
+  the human disable the gate on demand, always with a visible bypass notice, never
+  silently. §6 above should be read as historical design intent, not the literal
+  implemented mechanism (see `.agent/PLAN.md`'s Phase 3 section for the current source of
+  truth). Re-review again once Phase 3 is implemented and reviewed.
 - Any new schedule data source is added or the EventKit integration's scope changes
   (e.g. gains write access — not currently planned).
 - Any change to the local API's bind address, CORS `HUD_ORIGIN` handling, or

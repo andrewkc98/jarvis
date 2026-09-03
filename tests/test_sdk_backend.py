@@ -1,10 +1,16 @@
 import asyncio
 
 import pytest
-from claude_agent_sdk import ResultMessage, StreamEvent
+from claude_agent_sdk import (
+    AssistantMessage,
+    ResultMessage,
+    ServerToolUseBlock,
+    StreamEvent,
+    ToolUseBlock,
+)
 
 from jarvis import config
-from jarvis.orchestrator import sdk_backend
+from jarvis.orchestrator import permissions, sdk_backend
 
 
 class FakeClient:
@@ -67,6 +73,38 @@ def test_ensure_connected_connects_once_and_reuses_the_client(mocked_config, moc
     assert first is second
     assert len(FakeClient.instances) == 1
     assert FakeClient.instances[0].connect_calls == 1
+
+
+def test_ensure_connected_preserves_permission_mode_and_wires_pre_tool_use_hook(mocked_config, mocked_client):
+    """Phase 3: permission_mode stays bypassPermissions AND a PreToolUse HookMatcher
+    gates vault-mutating tools via permissions.pre_tool_use_hook."""
+    backend = sdk_backend.SDKBackend()
+    asyncio.run(backend._ensure_connected())
+
+    options = FakeClient.instances[0].options
+    assert options.permission_mode == "bypassPermissions"
+
+    assert "PreToolUse" in options.hooks
+    matchers = options.hooks["PreToolUse"]
+    assert len(matchers) == 1
+    matcher = matchers[0]
+    assert matcher.matcher is None
+    assert matcher.hooks == [permissions.pre_tool_use_hook]
+
+    # Concise spoken responses: system_prompt must APPEND to the claude_code
+    # preset (a bare string would fully replace the default prompt and break
+    # agentic tool-use). Assert the exact dict, not just "some prompt was set".
+    assert options.system_prompt == {
+        "type": "preset",
+        "preset": "claude_code",
+        "append": (
+            "Your responses are spoken aloud via text-to-speech at a deliberate pace, "
+            "so verbosity has a real time cost. Keep answers brief and conversational — "
+            "typically one to three sentences — unless the request genuinely needs more "
+            "detail (e.g. an explicit list or a detailed explanation was asked for). "
+            "Do not restate the question, and skip unnecessary preamble."
+        ),
+    }
 
 
 def test_ensure_connected_raises_on_failed_mcp_server(monkeypatch, mocked_config):
@@ -140,6 +178,23 @@ def _stream_event(text, parent_tool_use_id=None):
     )
 
 
+def _assistant_message(content, parent_tool_use_id=None):
+    return AssistantMessage(
+        content=content,
+        model="claude-3",
+        parent_tool_use_id=parent_tool_use_id,
+        session_id="s",
+    )
+
+
+def _tool_use_block(name, block_id="t"):
+    return ToolUseBlock(id=block_id, name=name, input={})
+
+
+def _server_tool_use_block(name, block_id="s"):
+    return ServerToolUseBlock(id=block_id, name=name, input={})
+
+
 def _result_message(is_error=False, result=None, errors=None):
     return ResultMessage(
         subtype="success",
@@ -199,3 +254,97 @@ def test_ask_stream_reuses_connection_across_two_calls(mocked_config, mocked_cli
     assert len(FakeClient.instances) == 1
     assert FakeClient.instances[0].connect_calls == 1
     assert FakeClient.instances[0].query_calls == ["one", "two"]
+
+
+def test_ask_stream_records_top_level_tool_use_names(mocked_config, mocked_client):
+    backend = sdk_backend.SDKBackend()
+
+    async def run():
+        client = await backend._ensure_connected()
+        client.responses = [
+            _assistant_message([_tool_use_block("Read")]),
+            _stream_event("ok"),
+            _result_message(),
+        ]
+        return [chunk async for chunk in backend.ask_stream("hi")]
+
+    asyncio.run(run())
+    assert backend.last_tools_fired == ["Read"]
+
+
+def test_ask_stream_records_multiple_tools_preserving_order_and_duplicates(mocked_config, mocked_client):
+    backend = sdk_backend.SDKBackend()
+
+    async def run():
+        client = await backend._ensure_connected()
+        client.responses = [
+            _assistant_message([_tool_use_block("Edit"), _tool_use_block("Read", "t2")]),
+            _assistant_message([_tool_use_block("Edit", "t3")]),
+            _result_message(),
+        ]
+        return [chunk async for chunk in backend.ask_stream("hi")]
+
+    asyncio.run(run())
+    assert backend.last_tools_fired == ["Edit", "Read", "Edit"]
+
+
+def test_ask_stream_ignores_nested_and_server_tool_blocks(mocked_config, mocked_client):
+    backend = sdk_backend.SDKBackend()
+
+    async def run():
+        client = await backend._ensure_connected()
+        client.responses = [
+            _assistant_message([_tool_use_block("Nested", "n")], parent_tool_use_id="subagent-1"),
+            _assistant_message([_server_tool_use_block("ServerTool")]),
+            _stream_event("ok"),
+            _result_message(),
+        ]
+        return [chunk async for chunk in backend.ask_stream("hi")]
+
+    asyncio.run(run())
+    assert backend.last_tools_fired == []
+
+
+def test_ask_stream_no_tool_use_yields_empty_list(mocked_config, mocked_client):
+    backend = sdk_backend.SDKBackend()
+
+    async def run():
+        client = await backend._ensure_connected()
+        client.responses = [_stream_event("just text"), _result_message()]
+        return [chunk async for chunk in backend.ask_stream("hi")]
+
+    asyncio.run(run())
+    assert backend.last_tools_fired == []
+
+
+def test_ask_stream_resets_last_tools_fired_between_calls(mocked_config, mocked_client):
+    backend = sdk_backend.SDKBackend()
+
+    async def run():
+        client = await backend._ensure_connected()
+        client.responses = [_assistant_message([_tool_use_block("First")]), _result_message()]
+        first = [chunk async for chunk in backend.ask_stream("one")]
+        client.responses = [_assistant_message([_tool_use_block("Second")]), _result_message()]
+        second = [chunk async for chunk in backend.ask_stream("two")]
+        return first, second
+
+    asyncio.run(run())
+    assert backend.last_tools_fired == ["Second"]
+
+
+def test_ask_stream_keeps_observed_tools_when_stream_raises(mocked_config, mocked_client, monkeypatch):
+    class RaisingClient(FakeClient):
+        async def receive_response(self):
+            yield _assistant_message([_tool_use_block("Observed")])
+            raise RuntimeError("stream dropped")
+
+    monkeypatch.setattr(sdk_backend, "ClaudeSDKClient", RaisingClient)
+    backend = sdk_backend.SDKBackend()
+
+    async def run():
+        await backend._ensure_connected()
+        return [chunk async for chunk in backend.ask_stream("hi")]
+
+    with pytest.raises(RuntimeError, match="stream dropped"):
+        asyncio.run(run())
+    assert backend.last_tools_fired == ["Observed"]

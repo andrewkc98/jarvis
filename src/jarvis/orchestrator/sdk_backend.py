@@ -10,9 +10,18 @@ import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage, StreamEvent
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    HookMatcher,
+    ResultMessage,
+    StreamEvent,
+    ToolUseBlock,
+)
 
 from jarvis import config
+from jarvis.orchestrator import permissions
 
 
 _MCP_TEMPLATE_PATH = config.MCP_CONFIG_PATH.with_name("mcp-config.json.example")
@@ -36,6 +45,7 @@ class SDKBackend:
 
     def __init__(self) -> None:
         self._client: ClaudeSDKClient | None = None
+        self.last_tools_fired: list[str] = []
 
     async def _ensure_connected(self) -> ClaudeSDKClient:
         if self._client is not None:
@@ -47,6 +57,22 @@ class SDKBackend:
             permission_mode="bypassPermissions",
             cwd=str(_SCRATCH_CWD),
             include_partial_messages=True,
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",
+                "append": (
+                    "Your responses are spoken aloud via text-to-speech at a deliberate pace, "
+                    "so verbosity has a real time cost. Keep answers brief and conversational — "
+                    "typically one to three sentences — unless the request genuinely needs more "
+                    "detail (e.g. an explicit list or a detailed explanation was asked for). "
+                    "Do not restate the question, and skip unnecessary preamble."
+                ),
+            },
+            hooks={
+                "PreToolUse": [
+                    HookMatcher(matcher=None, hooks=[permissions.pre_tool_use_hook]),
+                ],
+            },
         )
         client = ClaudeSDKClient(options)
         await client.connect()
@@ -78,6 +104,7 @@ class SDKBackend:
 
     async def ask_stream(self, prompt: str) -> AsyncIterator[str]:
         """Ask Claude a vault question, yielding streamed text deltas as they arrive."""
+        self.last_tools_fired = []
         client = await self._ensure_connected()
         await client.query(prompt)
         async for message in client.receive_response():
@@ -93,6 +120,11 @@ class SDKBackend:
                 text = delta.get("text")
                 if text:
                     yield text
+            elif isinstance(message, AssistantMessage):
+                if message.parent_tool_use_id is None:
+                    for element in message.content:
+                        if isinstance(element, ToolUseBlock):
+                            self.last_tools_fired.append(element.name)
             elif isinstance(message, ResultMessage):
                 if message.is_error:
                     detail = message.result or "; ".join(message.errors or []) or "unknown error"

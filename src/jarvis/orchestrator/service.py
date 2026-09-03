@@ -1,11 +1,15 @@
 """Application service connecting audio capture, transcription, and speech."""
 
 import asyncio
+import sys
+import time
 from collections.abc import AsyncIterator
 
 from jarvis.voice import capture, stt
 from jarvis.orchestrator import router, sdk_backend
 from jarvis.providers import schedule_provider
+from jarvis.telemetry import store
+from jarvis.telemetry.store import TelemetryEntry
 from jarvis.voice.tts import SentenceBuffer
 from jarvis.voice.tts import Speaker
 
@@ -76,13 +80,62 @@ class JarvisService:
         self._speaker = Speaker(voice_model_path)
         self._sdk_backend = sdk_backend.SDKBackend()
 
-    async def aanswer(self, text: str) -> str:
+    async def aanswer(self, text: str, *, stt_ms: float | None = None) -> str:
         """Answer and speak one turn using the schedule provider or the SDK backend."""
-        if router.route(text) == "schedule":
-            response = self._answer_schedule()
-            await asyncio.to_thread(self._speaker.say, response)
-            return response
-        return await _speak_stream(self._sdk_backend.ask_stream(text), self._speaker)
+        started = time.monotonic()
+        is_schedule = router.route(text) == "schedule"
+        path = "schedule" if is_schedule else "sdk"
+        try:
+            if is_schedule:
+                response, dispatch_ms = await self._dispatch_schedule()
+            else:
+                response, dispatch_ms = await self._dispatch_sdk(text)
+        except Exception as exc:
+            self._record_failure(path, started, stt_ms, type(exc).__name__)
+            raise
+
+        self._record_success(path, started, stt_ms, dispatch_ms)
+        return response
+
+    async def _dispatch_schedule(self) -> tuple[str, float]:
+        dispatch_start = time.monotonic()
+        response = self._answer_schedule()
+        await asyncio.to_thread(self._speaker.say, response)
+        return response, (time.monotonic() - dispatch_start) * 1000
+
+    async def _dispatch_sdk(self, text: str) -> tuple[str, float]:
+        dispatch_start = time.monotonic()
+        response = await _speak_stream(self._sdk_backend.ask_stream(text), self._speaker)
+        return response, (time.monotonic() - dispatch_start) * 1000
+
+    def _record_success(self, path, started, stt_ms, dispatch_ms) -> None:
+        entry = TelemetryEntry(
+            path=path,
+            duration_ms=(time.monotonic() - started) * 1000,
+            stt_ms=stt_ms,
+            dispatch_ms=dispatch_ms,
+            tools_fired=self._sdk_backend.last_tools_fired if path == "sdk" else [],
+            error=None,
+        )
+        self._append_safe(entry)
+
+    def _record_failure(self, path, started, stt_ms, error_name) -> None:
+        entry = TelemetryEntry(
+            path=path,
+            duration_ms=(time.monotonic() - started) * 1000,
+            stt_ms=stt_ms,
+            dispatch_ms=0.0,
+            tools_fired=[],
+            error=error_name,
+        )
+        self._append_safe(entry)
+
+    @staticmethod
+    def _append_safe(entry) -> None:
+        try:
+            store.append_entry(entry)
+        except Exception as exc:
+            print(f"[jarvis] telemetry write failed: {exc}", file=sys.stderr)
 
     @staticmethod
     def _format_event(event) -> str:
@@ -110,8 +163,10 @@ class JarvisService:
     async def arun_once(self) -> str:
         """Capture and transcribe one utterance, then speak the response."""
         audio = capture.record_on_enter()
+        stt_start = time.monotonic()
         transcript = stt.transcribe(audio)
-        return await self.aanswer(transcript)
+        stt_ms = (time.monotonic() - stt_start) * 1000
+        return await self.aanswer(transcript, stt_ms=stt_ms)
 
     async def arun_text(self, text: str) -> str:
         """Speak a supplied text response without using audio capture or STT."""
