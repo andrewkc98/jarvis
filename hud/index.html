@@ -291,12 +291,13 @@ const MOCK_TELEMETRY = [
 ];
 
 const MOCK_EVENTS = [
-  { summary: "Team sync", offsetMin: 26, durMin: 30 },
-  { summary: "1:1 — Priya", offsetMin: 95, durMin: 25 },
-  { summary: "Design review: HUD v2", offsetMin: 180, durMin: 45 },
-  { summary: "Deploy window (staging)", offsetMin: 320, durMin: 60 },
-  { summary: "Retro", offsetMin: 400, durMin: 30 },
-  { summary: "Oncall handoff", offsetMin: 470, durMin: 15 }
+  { summary: "Team sync", all_day: false, offsetMin: 26, durMin: 30 },
+  { summary: "Company holiday", all_day: true, dateOffset: 1, durDays: 1 },
+  { summary: "1:1 — Priya", all_day: false, offsetMin: 95, durMin: 25 },
+  { summary: "Design review: HUD v2", all_day: false, offsetMin: 180, durMin: 45 },
+  { summary: "Deploy window (staging)", all_day: false, offsetMin: 320, durMin: 60 },
+  { summary: "Retro", all_day: false, offsetMin: 400, durMin: 30 },
+  { summary: "Oncall handoff", all_day: false, offsetMin: 470, durMin: 15 }
 ];
 
 const AUDIO = {
@@ -526,11 +527,19 @@ function mock() {
   const vitals = sc === "degraded"
     ? { cpu_percent: 87.4, ram_percent: 92.1, disk_percent: 71.3, gpu: "unavailable", cpu_cores: 10, ram_total_gb: 32 }
     : { cpu_percent: 34.2, ram_percent: 61.0, disk_percent: 48.5, gpu: "unavailable", cpu_cores: 10, ram_total_gb: 32 };
-  let schedule = { events: MOCK_EVENTS.map(e => ({
-    summary: e.summary,
-    start: new Date(now + e.offsetMin * 60000).toISOString(),
-    end: new Date(now + (e.offsetMin + e.durMin) * 60000).toISOString()
-  })) };
+  let schedule = { events: MOCK_EVENTS.map(e => {
+    if (e.all_day) {
+      const start = new Date(now);
+      start.setHours(0, 0, 0, 0);
+      start.setDate(start.getDate() + e.dateOffset);
+      const end = new Date(start);
+      end.setDate(end.getDate() + e.durDays);
+      return { summary: e.summary, all_day: true, start: start.toISOString(), end: end.toISOString() };
+    }
+    return { summary: e.summary, all_day: false,
+      start: new Date(now + e.offsetMin * 60000).toISOString(),
+      end: new Date(now + (e.offsetMin + e.durMin) * 60000).toISOString() };
+  }) };
   let scheduleErr = null, vaultErr = null, approval = null;
   let vault = { daily_note_excerpt: "Shipped the telemetry ring buffer. Next: wire the schedule fast-path so calendar questions never touch the model.\n\nOpen thread: TTS latency spikes after long dispatches.", open_task_count: 3 };
   let entries = MOCK_TELEMETRY.map(e => ({ ...e, timestamp: new Date(now - e.offset * 1000).toISOString() }));
@@ -568,6 +577,67 @@ function budgetColor(ms) {
   const r = ms / budget();
   return r > 1.5 ? "#e0674f" : r >= 1.0 ? "#c99a3e" : "#c6cbc8";
 }
+
+// schedule-format:start
+function formatScheduleEvent(event, now) {
+  const DIM_TIME = "#aeb5b2", DIM_REL = "#5d6663";
+  const allDay = event && event.all_day === true;
+  const start = event && event.start != null ? new Date(event.start) : new Date(NaN);
+  const end = event && event.end != null ? new Date(event.end) : new Date(NaN);
+  const startValid = Number.isFinite(start.getTime());
+  const endValid = Number.isFinite(end.getTime());
+  const p = (n) => String(n).padStart(2, "0");
+  const time = allDay ? "all day" : startValid ? p(start.getHours()) + ":" + p(start.getMinutes()) : "--:--";
+  const blank = { time, dur: "", rel: "", soon: false, timeColor: DIM_TIME, relColor: DIM_REL };
+  if (!startValid || !endValid || end.getTime() <= start.getTime()) return blank;
+
+  const span = end.getTime() - start.getTime();
+  const localDay = (d) => Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) / 86400000;
+  const durationMinutes = allDay ? (localDay(end) - localDay(start)) * 1440 : Math.round(span / 60000);
+  const duration = () => {
+    if (!Number.isFinite(durationMinutes) || durationMinutes <= 0) return "";
+    if (durationMinutes < 60) return Math.round(durationMinutes) + " min";
+    if (durationMinutes < 1440) {
+      const h = Math.floor(durationMinutes / 60), m = Math.round(durationMinutes % 60);
+      return h + "h" + (m ? " " + m + "m" : "");
+    }
+    if (durationMinutes < 10080) {
+      const days = durationMinutes / 1440;
+      if (Number.isInteger(days)) return days + (days === 1 ? " day" : " days");
+      const d = Math.floor(days), h = Math.floor((durationMinutes - d * 1440) / 60);
+      return d + "d" + (h ? " " + h + "h" : "");
+    }
+    const weeks = durationMinutes / 10080;
+    if (Number.isInteger(weeks)) return weeks + (weeks === 1 ? " week" : " weeks");
+    const w = Math.floor(weeks), d = Math.floor((durationMinutes - w * 10080) / 1440);
+    return w + "w" + (d ? " " + d + "d" : "");
+  };
+  const dur = duration();
+  if (allDay) {
+    const today = localDay(now), first = localDay(start), last = localDay(end);
+    let rel;
+    if (today >= last) rel = "ended";
+    else if (today >= first) rel = last - first === 1 ? "today" : "in progress";
+    else {
+      const days = first - today;
+      if (days === 1) rel = "tomorrow";
+      else if (days < 7) rel = "in " + days + " days";
+      else if (days % 7 === 0) rel = "in " + (days / 7) + " week" + (days / 7 === 1 ? "" : "s");
+      else rel = "in " + Math.floor(days / 7) + "w" + (days % 7 ? " " + (days % 7) + "d" : "");
+    }
+    return { time, dur, rel, soon: false, timeColor: DIM_TIME, relColor: DIM_REL };
+  }
+  const roundedUntil = Math.round((start.getTime() - now.getTime()) / 60000);
+  let rel, soon = false;
+  if (now.getTime() >= end.getTime()) rel = "ended";
+  else if (now.getTime() >= start.getTime()) rel = Math.abs(roundedUntil) < 2 ? "now" : "in progress";
+  else if (Math.abs(roundedUntil) < 2) rel = "now";
+  else if (roundedUntil < 60) rel = "in " + roundedUntil + "m";
+  else rel = "in " + Math.floor(roundedUntil / 60) + "h " + (roundedUntil % 60) + "m";
+  soon = rel === "now" || (roundedUntil >= 0 && roundedUntil <= 15);
+  return { time, dur, rel, soon, timeColor: soon ? "#4fe0cf" : DIM_TIME, relColor: soon ? "#4fe0cf" : DIM_REL };
+}
+// schedule-format:end
 
 // ---------- Pure presentation computation (was `renderVals()`, unchanged in substance) ----------
 function computeVals() {
@@ -619,24 +689,9 @@ function computeVals() {
   // ---- schedule ----
   const notice = scheduleErr ? (NOTICES[scheduleErr] || { title: "Schedule unavailable", body: "The schedule endpoint did not answer. Retrying on each poll." }) : null;
   const rawEvents = (scheduleData && scheduleData.events) || [];
-  const events = redacted || notice ? [] : rawEvents.slice(0, EVENT_CAP).map(e => {
-    const s = new Date(e.start), en = e.end ? new Date(e.end) : null;
-    const mins = Math.round((s - now) / 60000);
-    const soon = mins <= 15 && mins >= -5;
-    let rel;
-    if (mins < -1) rel = "in progress";
-    else if (mins <= 0) rel = "now";
-    else if (mins < 60) rel = "in " + mins + "m";
-    else rel = "in " + Math.floor(mins / 60) + "h " + (mins % 60) + "m";
-    const p = (n) => String(n).padStart(2, "0");
-    return {
-      time: p(s.getHours()) + ":" + p(s.getMinutes()),
-      dur: en ? Math.round((en - s) / 60000) + " min" : "",
-      summary: e.summary || "(untitled)",
-      rel, relColor: soon ? "#4fe0cf" : "#5d6663",
-      timeColor: soon ? "#4fe0cf" : "#aeb5b2"
-    };
-  });
+  const events = redacted || notice ? [] : rawEvents.slice(0, EVENT_CAP).map(e => ({
+    ...formatScheduleEvent(e, new Date(now)), summary: e.summary || "(untitled)"
+  }));
   const shownEvents = Math.min(rawEvents.length, EVENT_CAP);
   const scheduleCountLabel = redacted ? "hidden"
     : notice ? "unavailable"

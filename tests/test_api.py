@@ -20,7 +20,18 @@ def monkeypatched_client(monkeypatch):
         schedule_provider,
         "get_upcoming_events",
         lambda: [
-            {"summary": "Standup", "start": "2026-09-03T09:00:00Z", "end": "2026-09-03T09:15:00Z"}
+            {
+                "summary": "Standup",
+                "start": "2026-09-03T09:00:00Z",
+                "end": "2026-09-03T09:15:00Z",
+                "all_day": False,
+            },
+            {
+                "summary": "Company Holiday",
+                "start": "2026-09-04T00:00:00Z",
+                "end": "2026-09-05T00:00:00Z",
+                "all_day": True,
+            },
         ],
     )
     monkeypatch.setattr(
@@ -68,7 +79,14 @@ def test_schedule_success(monkeypatched_client):
                 "summary": "Standup",
                 "start": "2026-09-03T09:00:00Z",
                 "end": "2026-09-03T09:15:00Z",
-            }
+                "all_day": False,
+            },
+            {
+                "summary": "Company Holiday",
+                "start": "2026-09-04T00:00:00Z",
+                "end": "2026-09-05T00:00:00Z",
+                "all_day": True,
+            },
         ]
     }
 

@@ -44,6 +44,24 @@ reference implementation only.
 
 The first schedule query triggers a one-time macOS Calendar permission dialog.
 
+### Calendar access troubleshooting
+
+To inspect the EventKit authorization state without creating an event store, prompting
+for access, or reading calendar content, run this content-blind check from the repository
+venv:
+
+```bash
+.venv/bin/python -c 'import EventKit; print(EventKit.EKEventStore.authorizationStatusForEntityType_(EventKit.EKEntityTypeEvent))'
+```
+
+The installed binding reports status `3` when Calendar events have readable full access;
+status `0` means access is still not determined. Other statuses are not readable by
+Jarvis. If access is not readable, open System Settings → Privacy & Security → Calendars
+and allow the identity that will run Jarvis. Launch and check the API from the same
+Terminal/application identity that was authorized: macOS TCC permissions are identity-
+specific, and different Python or Terminal hosts must not be assumed to share an
+authorization identity. Do not use a blanket `tccutil reset` while troubleshooting.
+
 Seven Obsidian actions that modify the vault (`vault_append`, `vault_copy`,
 `vault_delete`, `vault_move`, `vault_patch`, `vault_write`, `command_execute`) pause for
 a terminal yes/no confirmation before executing, as a safeguard against speech-to-text
@@ -51,9 +69,34 @@ mistranscription. Every other action — reads, searches, and anything outside O
 is unaffected. Set `JARVIS_SKIP_CONFIRMATION=1` before starting Jarvis to skip these
 confirmations for that run; a notice is still printed for each one that's auto-approved.
 
-## Local data API for the HUD
+## Local HUD and data API
 
-Run the API service (this is the only supported way to launch it):
+For interactive use, start the local API and HUD together:
+
+```bash
+./jarvis-hud
+```
+
+This starts the loopback API on port `8765`, serves the HUD on port `4173` by default,
+supplies the API's CORS origin and voice-model path, opens one browser tab at the printed
+`127.0.0.1` URL, and remains in the foreground. Press `Ctrl-C` to shut down the servers
+owned by the launcher.
+
+The launcher accepts these options:
+
+- `--voice-model PATH` — use a specific Piper `.onnx` model. Model resolution precedence
+  is the explicit option, then `JARVIS_VOICE_MODEL`, then
+  `<repository>/en_US-lessac-medium.onnx`; the matching `<model>.json` companion is also
+  required.
+- `--hud-port PORT` — serve the HUD on a different port (default `4173`; it cannot be
+  `8765`).
+- `--no-browser` — start the API and HUD without opening a browser tab.
+
+Opening `hud/index.html` directly as `file://` leaves the display in mock mode because it
+has no allowed HTTP origin. Use `./jarvis-hud` for the live HUD.
+
+For an advanced/manual API-only launch, retain the existing environment configuration
+(`JARVIS_API_PORT`, `HUD_ORIGIN`, and `JARVIS_VOICE_MODEL`) and run:
 
 ```bash
 python -m jarvis.api.launcher

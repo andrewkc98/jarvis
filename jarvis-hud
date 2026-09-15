@@ -1,0 +1,25 @@
+#!/bin/sh
+
+script_path=$0
+case $script_path in
+    /*) ;;
+    *) script_path=$(pwd -P)/$script_path ;;
+esac
+
+while [ -L "$script_path" ]; do
+    link_target=$(readlink "$script_path") || exit 1
+    case $link_target in
+        /*) script_path=$link_target ;;
+        *) script_path=$(dirname "$script_path")/$link_target ;;
+    esac
+done
+
+repo_dir=$(CDPATH= cd -P -- "$(dirname "$script_path")" && pwd -P) || exit 1
+python_bin=$repo_dir/.venv/bin/python
+
+if [ ! -x "$python_bin" ]; then
+    echo "jarvis-hud: run 'python -m venv .venv' from the repository root first" >&2
+    exit 1
+fi
+
+exec "$python_bin" -m jarvis.hud_launcher "$@"

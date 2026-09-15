@@ -115,6 +115,7 @@ def _register_routes(app: FastAPI) -> None:
                     "summary": event["summary"],
                     "start": event["start"],
                     "end": event["end"],
+                    "all_day": event["all_day"],
                 }
                 for event in events
             ]
