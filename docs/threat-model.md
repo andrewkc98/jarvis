@@ -1,8 +1,8 @@
 # Threat Model — Local JARVIS HUD
 
-Status: current-state model, updated 2026-09-03. This document describes the controls
-implemented by the local JARVIS voice, CLI, and browser/HUD paths. It is a security
-model for this single-user, local device; it is not a general recommendation for a
+Status: current-state model, updated 2026-09-30. This document describes the controls
+implemented by the local JARVIS interactive voice loop, CLI, and browser/HUD paths. It is a
+security model for this single-user, local device; it is not a general recommendation for a
 shared or higher-stakes machine.
 
 ## 1. Scope
@@ -20,6 +20,43 @@ paths use the same seven-tool confirmation gate and the same accepted
 `bypassPermissions` posture: the hook explicitly gates the seven mutating tools, while
 other tools retain the full-capability posture accepted for this single-user device.
 
+Starting with the supported launcher, the interactive voice loop is run as a supervised
+child of the launcher (a separate process from the API and HUD). The launcher owns the
+voice child's lifecycle: it is terminated then killed on timeout on every shutdown path, a
+SIGTERM from the launcher interrupts the loop cleanly, and SIGKILL delivered to the voice
+child terminates it immediately without Python cleanup; if the launcher remains alive,
+supervision observes the child's numeric exit. SIGKILL delivered to the launcher itself
+prevents launcher cleanup and can leave surviving children without supervision. The launcher
+controls which process owns terminal input. With voice enabled (the default), the voice child owns this terminal and owns its own Enter-driven
+confirmations, while the API's stdin is detached so the API's guarded-tool confirmations are
+HUD-only. With `--no-voice`, no voice child runs and the API's guarded-tool confirmations
+remain a terminal prompt on this line. The two confirmation channels and the two input
+sources are not cross-process serialized in this release and must not be intentionally
+overlapped: a voice turn and a HUD confirmation contend over the same shared approval record
+without a global ordering.
+
+Browser voice (launcher `--browser-voice`, API mode `browser`) is a third input path and
+is mutually exclusive with terminal capture under the supported launcher: terminal mode
+spawns the voice child and detaches API stdin; browser and off modes spawn no voice child and
+leave API stdin inherited, so the terminal approval prompt remains a fallback alongside the
+HUD. The HUD page starts recording only on a direct user click and the browser's own
+microphone permission prompt; Jarvis neither controls nor can inspect the browser's
+permission preference or history. The recording (at most 30 seconds and 8 MiB, WebM/Ogg/MP4)
+is posted from the exact configured HUD origin (CORS allows only that origin, GET/POST,
+no credentials) to the loopback API. A bounded memory-only `ffmpeg` decode (fixed argv, no
+shell, no temporary files, timeout, sample-count cap) feeds the normal local STT and
+assistant pipeline; output is returned as JSON. Optional speech is synthesized by local Piper
+and returned as a WAV the page plays itself (subject to browser autoplay policy; a blocked
+autoplay leaves text and a manual Play control). The API never plays audio on the server in
+this path, and typed-command and voice turns share one API conversation, serialized by the
+command lock. Cancellation stops capture and page playback immediately and cancels the exact
+API turn (preventing later dispatch and discarding the interrupted SDK state), but a native
+decoder, STT, or Piper worker already running may finish locally with its output ignored.
+Cancel is not an approval decision. HUD redaction hides the transcript, response, typed
+reply, and playback controls without losing in-memory state. A manually started CLI is
+outside the API lock and can overlap with API turns. Live browser, microphone, and speaker
+behavior has not been validated here.
+
 The service binds to loopback through the supported launcher. The system uses direct
 macOS Calendar access and the Obsidian Local REST API/native MCP endpoint. The security
 of those external components and macOS's own permission system is out of scope; this
@@ -31,6 +68,10 @@ document covers how this repository handles their data and credentials.
   security-research material.
 - **Calendar data** — schedule, meeting titles and descriptions, and attendee details.
 - **Voice audio** — anything audible during a push-to-talk capture window.
+- **Browser voice audio and WAV replies** — the in-memory recording a HUD page uploads
+  after a user gesture, the decoded waveform, transcript, and response, and the Piper WAV
+  returned to the page. Jarvis keeps them in memory only for the turn; they are not written
+  to telemetry or any persistent store.
 - **System state** — the vitals exposed by the local API.
 - **Telemetry metadata** — a local `0600` record of schema version, UTC timestamp,
   route/path, durations, fired tool names, and exception class name. It contains no
@@ -86,6 +127,18 @@ The seven guarded tools are `vault_append`, `vault_copy`, `vault_delete`, `vault
 `bypassPermissions`, tools outside this set retain the accepted full-capability posture;
 the hook is not a general allow-list or default-deny boundary.
 
+The active tool inventory is accepted as a runtime property of the host and as the
+environment the launcher propagates to its children, not as something this repository pins
+below its own code. Beyond the tools wired into this repository — the local Obsidian MCP
+server and directly-invoked macOS Calendar — the environment may also include ambient MCP
+servers and filesystem settings discovered on the host (for example an Ollama or shell MCP
+server, and filesystem access) that are not declared in the repository Obsidian config. These
+may extend the set of tools with which an agent turn can act. The accepted posture treats
+this broad capability as a property of this single-user host: this repository does not
+recommend a strict MCP allow-list, empty or emptying setting sources, or narrowing the tool
+set; it manages capability through the seven-tool confirmation gate and the accepted
+full-capability posture instead.
+
 ## 6. Confirmation and approval record
 
 Before a guarded tool executes, the confirmation hook presents a sanitized preview to
@@ -95,10 +148,15 @@ and must not be treated as an unrestricted copy of the tool request.
 Confirmation is dual-channel. Either the terminal or the HUD can submit `allow` or
 `deny`. When a pending slot exists, both channels contend through the shared
 `pending_approval.json` record. The record atomically accepts the first valid decision;
-later answers cannot overwrite or reverse the winner. The winning decision and source
-are read back from that persisted record. A terminal-only confirmation is used only
-when no HUD record was claimed. The record is local, `0600`, and should be treated as a
-protected sensitive asset.
+later answers cannot overwrite or reverse the winner (first-decision-wins). The winning
+decision and source are read back from that persisted record, so `decided_by="hud"` is a
+record of which channel won arbitration, not independent proof that a human decided. Under
+the accepted posture on this single-user device, the same trusted owner runs the HUD, and
+the same local trust boundary means the agent can itself reach the loopback API or the
+approval file that the HUD uses. The gate is therefore defended as a guard against
+accidental or STT-mistranscribed action (including an unconstrained model), not as an
+adversarial authorization boundary against the same user's own agent. The record is local,
+`0600`, and should be treated as a protected sensitive asset.
 
 The `JARVIS_SKIP_CONFIRMATION` environment variable can disable this narrow gate when
 the human deliberately needs it disabled. The bypass is visible rather than silent.
@@ -145,6 +203,17 @@ All other tools continue under the accepted full-capability `bypassPermissions` 
    assistant may not be appropriate under every institute or employer device policy.
    This is an operational risk, not a technical control; verify the applicable policy
    before enabling unattended/background operation.
+9. **Unsupervised or orphaned voice child.** The launcher owns the voice loop's lifecycle.
+   It terminates the child then kills it on timeout on every shutdown path, and a SIGTERM
+   from the launcher is caught to interrupt a blocking terminal capture cleanly. This
+   cleanup is bounded to the launcher's own owned children and assumes the launcher (not a
+   signal manager) receives the terminating signal. If the voice child receives a `SIGKILL`
+   directly, it terminates immediately and cannot execute graceful Python cleanup; if the
+   launcher remains alive, supervision observes its numeric exit. The killed child does not
+   remain as an orphan holding the terminal input line. By contrast, a `SIGKILL` delivered to
+   the launcher itself prevents launcher cleanup and can leave surviving children without
+   supervision. On a single-user host this is an accidental-leak concern, not a privilege
+   escalation; it does not widen the tool or capability surface.
 
 ## 8. Current verification and assumptions
 
@@ -155,7 +224,25 @@ All other tools continue under the accepted full-capability `bypassPermissions` 
 - API command turns are serialized within the API process. The two processes do not
   share conversation history or a single SDK client.
 - The seven-tool confirmation hook is active for both channels, and the shared local
-  approval record provides first-writer-wins arbitration.
+  approval record provides first-decision-wins arbitration; `decided_by="hud"` records which
+  channel won arbitration, not independent proof of a human decision.
+- The launcher supervises the interactive voice child (terminate, then kill on timeout),
+  interrupts it cleanly on SIGTERM, and is the boundary that cleans up only its own owned
+  children. SIGKILL of the voice child terminates it immediately without Python cleanup, but
+  the still-alive launcher observes its numeric exit; SIGKILL of the launcher itself prevents
+  launcher cleanup and can leave surviving children without supervision.
+- With voice enabled the API's stdin is detached so its guarded-tool confirmations are HUD-
+  only and the voice child owns terminal input; with `--no-voice` the API's terminal
+  confirmation remains available. The two confirmation channels and input sources are not
+  cross-process serialized in this release and must not be intentionally overlapped.
+- The active tool inventory (built-ins, ambient MCP servers, and filesystem settings) is an
+  accepted runtime property of the host and is not narrowed below the repository Obsidian
+  config; capability is managed through the narrow confirmation gate and the accepted
+  full-capability posture.
+- Browser voice audio, transcripts, responses, and WAV replies stay in memory, travel only
+  between the exact configured HUD origin and the loopback API, and are not added to
+  telemetry or persistent stores; decoding uses bounded in-memory local `ffmpeg`. Cancellation
+  cannot interrupt native decode/STT/Piper work already running, only ignore its result.
 - Telemetry is local `0600` metadata only, with no prompt, response, raw error message,
   or vault content.
 - The human's acceptance of full-capability `bypassPermissions` outside the narrow

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 from threading import Thread as RealThread
 
 import pytest
@@ -13,7 +14,14 @@ from jarvis import hud_launcher as launcher
 
 
 def _args(**kwargs: object) -> argparse.Namespace:
-    values = {"voice_model": None, "hud_port": 4173, "no_browser": True}
+    values = {
+        "voice_model": None,
+        "hud_port": 4173,
+        "no_browser": True,
+        "browser_voice": False,
+        "no_voice": False,
+        "mode": "terminal",
+    }
     values.update(kwargs)
     return argparse.Namespace(**values)
 
@@ -51,6 +59,46 @@ def test_inherited_api_port_is_strict(monkeypatch: pytest.MonkeyPatch, bad: str)
 @pytest.mark.parametrize("bad", ["", " ", "0", "8765", "65536", "nope", "4173 "])
 def test_hud_port_validation(bad: str) -> None:
     assert launcher._parse_args(["--hud-port", bad]) is None
+
+
+def test_voice_mode_parsing_defaults_to_terminal_and_maps_flags() -> None:
+    default = launcher._parse_args([])
+    browser = launcher._parse_args(["--browser-voice"])
+    off = launcher._parse_args(["--no-voice"])
+
+    assert default is not None and default.mode == "terminal"
+    assert default.browser_voice is False
+    assert default.no_voice is False
+    assert browser is not None and browser.mode == "browser"
+    assert browser.browser_voice is True
+    assert browser.no_voice is False
+    assert off is not None and off.mode == "off"
+    assert off.browser_voice is False
+    assert off.no_voice is True
+
+
+@pytest.mark.parametrize("help_flag", ["-h", "--help"])
+def test_help_lists_browser_voice_and_keeps_no_voice_suppressed(
+    help_flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        launcher._parse_args([help_flag])
+
+    assert excinfo.value.code == 0
+    output = capsys.readouterr()
+    assert "--browser-voice" in output.out
+    assert "--no-voice" not in output.out
+    assert output.err == ""
+
+
+def test_browser_voice_and_no_voice_are_mutually_exclusive(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        launcher._parse_args(["--browser-voice", "--no-voice"])
+
+    assert excinfo.value.code == 2
+    output = capsys.readouterr()
+    assert "--browser-voice" in output.err
+    assert "--no-voice" in output.err
 
 
 def test_preflight_companion_is_literal_suffix(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -541,9 +589,205 @@ def test_child_spawn_contract_and_environment_is_not_logged(
     assert child_env["JARVIS_API_PORT"] == "8765"  # type: ignore[index]
     assert child_env["HUD_ORIGIN"] == "http://127.0.0.1:4173"  # type: ignore[index]
     assert child_env["JARVIS_VOICE_MODEL"] == str((root / "voice.onnx"))  # type: ignore[index]
+    assert child_env["JARVIS_VOICE_INPUT_MODE"] == "terminal"  # type: ignore[index]
     assert child_env["UNRELATED_SENTINEL"] == sentinel  # type: ignore[index]
     output = capsys.readouterr()
     assert sentinel not in output.out + output.err
+
+
+class StopAfterSecondWait:
+    def __init__(self, resources: launcher._Resources) -> None:
+        self.resources = resources
+        self.calls = 0
+
+    def wait(self, timeout: float) -> bool:
+        del timeout
+        self.calls += 1
+        if self.calls >= 2:
+            self.resources.user_stop.set()
+        return False
+
+    def clear(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("args", "expected_mode", "expect_voice", "expect_stdin"),
+    [
+        (_args(), "terminal", True, True),
+        (_args(browser_voice=True, mode="browser", no_browser=False), "browser", False, False),
+        (_args(no_voice=True, mode="off"), "off", False, False),
+    ],
+    ids=["terminal-default", "browser", "off"],
+)
+def test_voice_modes_control_api_environment_stdin_and_terminal_child(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    args: argparse.Namespace,
+    expected_mode: str,
+    expect_voice: bool,
+    expect_stdin: bool,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    resources = launcher._Resources()
+    resources.wakeup = StopAfterSecondWait(resources)  # type: ignore[assignment]
+    calls: list[dict[str, object]] = []
+    order: list[str] = []
+    opened: list[str] = []
+
+    def capture_popen(*popen_args: object, **kwargs: object) -> FakeProcess:
+        calls.append({"argv": popen_args[0], **kwargs})
+        child = FakeProcess()
+        if len(calls) == 2:
+            resources.user_stop.set()
+        return child
+
+    monkeypatch.setattr(launcher, "_HudHTTPServer", FakeServer)
+    monkeypatch.setattr(launcher.threading, "Thread", _fake_thread_factory())
+    monkeypatch.setattr(launcher.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(launcher, "_probe_url", lambda url, timeout: order.append("probe") or True)
+    monkeypatch.setattr(launcher.webbrowser, "open_new_tab", lambda url: opened.append(url) or True)
+
+    model = root / "voice.onnx"
+    assert launcher._run(args, model, root, resources) == 0
+    launcher._cleanup(resources)
+
+    assert len(calls) == (2 if expect_voice else 1)
+    assert order == ["probe", "probe"]
+    api_call = calls[0]
+    assert api_call["argv"] == [sys.executable, "-m", "jarvis.api.launcher"]
+    assert api_call["cwd"] == str(root)
+    assert api_call["shell"] is False
+    child_env = api_call["env"]
+    assert child_env["JARVIS_API_PORT"] == "8765"  # type: ignore[index]
+    assert child_env["HUD_ORIGIN"] == "http://127.0.0.1:4173"  # type: ignore[index]
+    assert child_env["JARVIS_VOICE_MODEL"] == str(model)  # type: ignore[index]
+    assert child_env["JARVIS_VOICE_INPUT_MODE"] == expected_mode  # type: ignore[index]
+    if expect_stdin:
+        assert api_call["stdin"] is launcher.subprocess.DEVNULL
+    else:
+        assert "stdin" not in api_call
+    if expect_voice:
+        assert calls[1]["argv"] == [
+            sys.executable,
+            "-m",
+            "jarvis.orchestrator.voice_loop",
+            "--voice-model",
+            str(model),
+        ]
+        assert calls[1]["cwd"] == str(root)
+        assert calls[1]["env"] == os.environ
+        assert calls[1]["shell"] is False
+        assert "stdin" not in calls[1]
+        assert "stdout" not in calls[1]
+        assert "stderr" not in calls[1]
+    else:
+        assert resources.voice_process is None
+    assert opened == (["http://127.0.0.1:4173/index.html"] if not args.no_browser else [])
+
+
+def test_terminal_voice_spawn_preserves_api_then_probe_then_browser_then_voice_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    calls: list[dict[str, object]] = []
+    order: list[str] = []
+    resources = launcher._Resources()
+    inherited = {"INHERITED_SENTINEL": "keep-me"}
+
+    class Child(FakeProcess):
+        pass
+
+    def capture_popen(*args: object, **kwargs: object) -> Child:
+        order.append("api" if len(calls) == 0 else "voice")
+        calls.append({"argv": args[0], **kwargs})
+        child = Child()
+        if len(calls) == 2:
+            resources.user_stop.set()
+        return child
+
+    monkeypatch.setattr(launcher.os, "environ", inherited)
+    monkeypatch.setattr(launcher, "_HudHTTPServer", FakeServer)
+    monkeypatch.setattr(launcher.threading, "Thread", _fake_thread_factory())
+    monkeypatch.setattr(launcher.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(launcher, "_probe_url", lambda url, timeout: order.append("probe") or True)
+    monkeypatch.setattr(launcher.webbrowser, "open_new_tab", lambda url: order.append("browser") or True)
+
+    model = root / "voice.onnx"
+    result = launcher._run(_args(no_browser=False), model, root, resources)
+    launcher._cleanup(resources)
+
+    assert result == 0
+    assert order == ["api", "probe", "probe", "browser", "voice"]
+    assert calls[0]["argv"] == [sys.executable, "-m", "jarvis.api.launcher"]
+    assert calls[0]["cwd"] == str(root)
+    assert calls[0]["shell"] is False
+    assert calls[0]["stdin"] is launcher.subprocess.DEVNULL
+    assert calls[0]["env"] == {
+        **inherited,
+        "JARVIS_API_PORT": "8765",
+        "HUD_ORIGIN": "http://127.0.0.1:4173",
+        "JARVIS_VOICE_MODEL": str(model),
+        "JARVIS_VOICE_INPUT_MODE": "terminal",
+    }
+    assert calls[1]["argv"] == [
+        sys.executable,
+        "-m",
+        "jarvis.orchestrator.voice_loop",
+        "--voice-model",
+        str(model),
+    ]
+    assert calls[1]["cwd"] == str(root)
+    assert calls[1]["env"] == inherited
+    assert calls[1]["shell"] is False
+    assert "stdin" not in calls[1]
+    assert "stdout" not in calls[1]
+    assert "stderr" not in calls[1]
+
+
+def test_voice_spawn_failure_reports_exact_message_and_finalization_cleans_api(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    resources = launcher._Resources()
+    api = FakeProcess()
+    calls = 0
+
+    def spawn(*args: object, **kwargs: object) -> FakeProcess:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return api
+        raise OSError("voice unavailable")
+
+    monkeypatch.setattr(launcher, "_HudHTTPServer", FakeServer)
+    monkeypatch.setattr(launcher.threading, "Thread", _fake_thread_factory())
+    monkeypatch.setattr(launcher.subprocess, "Popen", spawn)
+    monkeypatch.setattr(launcher, "_probe_url", lambda url, timeout: True)
+    assert launcher._run(_args(), tmp_path / "voice.onnx", tmp_path, resources) == 1
+    launcher._cleanup(resources)
+    assert capsys.readouterr().err == "jarvis-hud: could not start voice loop\n"
+    assert api.calls == ["terminate", "wait:5.0"]
+
+
+def test_voice_early_exit_reports_numeric_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    resources = launcher._Resources()
+
+    class Exited(FakeProcess):
+        def poll(self) -> int | None:
+            return 37
+
+    children = iter([FakeProcess(), Exited()])
+    monkeypatch.setattr(launcher, "_HudHTTPServer", FakeServer)
+    monkeypatch.setattr(launcher.threading, "Thread", _fake_thread_factory())
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *args, **kwargs: next(children))
+    monkeypatch.setattr(launcher, "_probe_url", lambda url, timeout: True)
+    assert launcher._run(_args(), tmp_path / "voice.onnx", tmp_path, resources) == 1
+    launcher._cleanup(resources)
+    assert "voice loop exited (status 37)" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("browser_result", [False, "raise"], ids=["false", "exception"])
@@ -755,6 +999,74 @@ def test_cleanup_timeout_expired_terminates_then_kills_only_owned_child() -> Non
     launcher._cleanup(resources)
     assert owned.calls == ["terminate", "wait:5.0", "kill", "wait"]
     assert unrelated.calls == []
+
+
+def test_cleanup_cleans_voice_before_api_and_handles_each_timeout_independently() -> None:
+    events: list[str] = []
+
+    class TimeoutChild:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def poll(self) -> None:
+            events.append(f"{self.name}:poll")
+            return None
+
+        def terminate(self) -> None:
+            events.append(f"{self.name}:terminate")
+
+        def kill(self) -> None:
+            events.append(f"{self.name}:kill")
+
+        def wait(self, timeout: float | None = None) -> int:
+            events.append(f"{self.name}:wait:{timeout}")
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(self.name, timeout)
+            return 0
+
+    resources = launcher._Resources()
+    resources.voice_process = TimeoutChild("voice")  # type: ignore[assignment]
+    resources.api_process = TimeoutChild("api")  # type: ignore[assignment]
+    launcher._cleanup(resources)
+    launcher._cleanup(resources)
+    assert events == [
+        "voice:poll",
+        "voice:terminate",
+        "voice:wait:5.0",
+        "voice:kill",
+        "voice:wait:None",
+        "api:poll",
+        "api:terminate",
+        "api:wait:5.0",
+        "api:kill",
+        "api:wait:None",
+    ]
+
+
+def test_cleanup_waits_for_already_exited_voice_and_api_without_terminating() -> None:
+    class ExitedChild:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def poll(self) -> int:
+            self.calls.append("poll")
+            return 0
+
+        def terminate(self) -> None:
+            self.calls.append("terminate")
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.calls.append("wait" if timeout is None else f"wait:{timeout}")
+            return 0
+
+    voice = ExitedChild()
+    api = ExitedChild()
+    resources = launcher._Resources()
+    resources.voice_process = voice  # type: ignore[assignment]
+    resources.api_process = api  # type: ignore[assignment]
+    launcher._cleanup(resources)
+    assert voice.calls == ["poll", "wait:5.0"]
+    assert api.calls == ["poll", "wait:5.0"]
 
 
 def test_unrelated_api_listener_is_never_operated_on(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

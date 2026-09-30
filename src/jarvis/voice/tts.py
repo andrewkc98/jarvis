@@ -53,27 +53,47 @@ class Speaker:
         self._model_path = model_path
         self._voice: PiperVoice | None = None
 
-    def say(self, text: str) -> None:
-        """Synthesize *text* with Piper and play it through the default audio device."""
+    def synthesize_wav(self, text: str) -> bytes:
+        """Synthesize *text* with Piper and return one complete in-memory WAV byte string."""
         if self._voice is None:
             self._voice = PiperVoice.load(str(self._model_path))
 
-        chunks = iter(self._voice.synthesize(text))
-        try:
-            first_chunk = next(chunks)
-        except StopIteration as exc:
-            raise ValueError("Piper produced no audio chunks") from exc
+        chunks = list(self._voice.synthesize(text))
+        if not chunks:
+            raise ValueError("Piper produced no audio chunks")
+
+        first = chunks[0]
+        for name, value in (
+            ("sample_rate", first.sample_rate),
+            ("sample_width", first.sample_width),
+            ("sample_channels", first.sample_channels),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"Piper chunk {name} must be a positive integer")
+
+        for index, chunk in enumerate(chunks[1:], start=1):
+            if (
+                chunk.sample_rate != first.sample_rate
+                or chunk.sample_width != first.sample_width
+                or chunk.sample_channels != first.sample_channels
+            ):
+                raise ValueError(f"Piper chunk {index} metadata is inconsistent with chunk 0")
+
+        if sum(len(chunk.audio_int16_bytes) for chunk in chunks) == 0:
+            raise ValueError("Piper produced no audio chunks")
 
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wav_file:
-            wav_file.setframerate(first_chunk.sample_rate)
-            wav_file.setsampwidth(first_chunk.sample_width)
-            wav_file.setnchannels(first_chunk.sample_channels)
-            wav_file.writeframes(first_chunk.audio_int16_bytes)
+            wav_file.setframerate(first.sample_rate)
+            wav_file.setsampwidth(first.sample_width)
+            wav_file.setnchannels(first.sample_channels)
             for chunk in chunks:
                 wav_file.writeframes(chunk.audio_int16_bytes)
+        return buf.getvalue()
 
-        buf.seek(0)
+    def say(self, text: str) -> None:
+        """Synthesize *text* with Piper and play it through the default audio device."""
+        buf = io.BytesIO(self.synthesize_wav(text))
         with wave.open(buf, "rb") as wav_file:
             frames = wav_file.readframes(wav_file.getnframes())
             audio = np.frombuffer(frames, dtype=np.int16)

@@ -24,6 +24,11 @@
   section { border: 1px solid #1b1f21; background: #0b0d0e; }
   button { font-family: inherit; }
   [hidden] { display: none !important; }
+  .voice-btn { padding: 5px 9px; font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; color: #c6cbc8;
+    background: #101314; border: 1px solid #2a3033; cursor: pointer; }
+  .voice-btn:hover:not(:disabled) { border-color: #4fe0cf; color: #e6ebe8; }
+  .voice-btn:focus-visible { outline: 1px solid #4fe0cf; outline-offset: 1px; }
+  .voice-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>
 </head>
 <body>
@@ -79,6 +84,16 @@
           <span id="levelText" style="flex: none; font-size: 9px; letter-spacing: 0.08em; width: 46px; text-align: right;"></span>
         </div>
         <div id="audioNote" style="margin-top: 10px; font-size: 9px; letter-spacing: 0.08em; color: #3a4240;"></div>
+        <div id="voicePanel" role="group" aria-label="Browser voice" style="margin-top: 10px;">
+          <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+            <button type="button" class="voice-btn" id="voiceStartBtn" aria-label="Start microphone recording" disabled>Start mic</button>
+            <button type="button" class="voice-btn" id="voiceStopBtn" aria-label="Stop recording and send" disabled>Stop &amp; Send</button>
+            <button type="button" class="voice-btn" id="voiceCancelBtn" aria-label="Cancel voice turn" disabled>Cancel</button>
+            <button type="button" class="voice-btn" id="voicePlayBtn" aria-label="Play reply" hidden>Play reply</button>
+            <button type="button" class="voice-btn" id="voiceStopPlayBtn" aria-label="Stop playback" hidden>Stop playback</button>
+          </div>
+          <div id="voiceStatus" role="status" aria-live="polite" style="margin-top: 8px; font-size: 10px; line-height: 1.4; color: #8d9793;"></div>
+        </div>
       </div>
     </section>
   </div>
@@ -206,6 +221,16 @@
       <span id="statWindow" style="flex: none;"></span>
     </div>
 
+    <div id="voiceTranscriptBar" hidden style="flex: none; display: flex; align-items: center; gap: 9px; padding: 6px 12px; border-top: 1px solid #16191b; background: #0b0e0f; min-width: 0; white-space: nowrap;">
+      <span style="flex: none; font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: #3f4744;">you said</span>
+      <span id="voiceTranscript" style="flex: 1; min-width: 0; font-size: 11px; color: #9fa8a4; overflow: hidden; text-overflow: ellipsis;"></span>
+    </div>
+
+    <div id="voiceReplyBar" hidden style="flex: none; display: flex; align-items: center; gap: 9px; padding: 6px 12px; border-top: 1px solid #16191b; background: #0b0e0f; min-width: 0; white-space: nowrap;">
+      <span style="flex: none; font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: #3f4744;">voice reply</span>
+      <span id="voiceReply" style="flex: 1; min-width: 0; font-size: 11px; color: #9fa8a4; overflow: hidden; text-overflow: ellipsis;"></span>
+    </div>
+
     <div id="cmdReplyBar" hidden style="flex: none; display: flex; align-items: center; gap: 9px; padding: 6px 12px; border-top: 1px solid #16191b; background: #0b0e0f; min-width: 0; white-space: nowrap;">
       <span id="cmdReplyTag" style="flex: none; font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: #3f4744;"></span>
       <span id="cmdReply" style="flex: 1; min-width: 0; font-size: 11px; color: #9fa8a4; overflow: hidden; text-overflow: ellipsis;"></span>
@@ -223,6 +248,7 @@
   </section>
 </main>
 
+<script src="voice.js"></script>
 <script>
 /*
  * JARVIS HUD — standalone build.
@@ -258,7 +284,6 @@ const CONFIG = {
   telemetryLimit: 20,
   latencyBudgetMs: 2000,
   mockScenario: "healthy", // healthy | degraded | empty | errors | approval · write | approval · exec | in flight | schema drift
-  pttBinding: "fn",
   audioState: "idle", // idle | listening | processing | speaking — overridden by a "jarvis-audio" CustomEvent if dispatched
   showTiming: true
 };
@@ -348,6 +373,7 @@ const STATE = {
   audio: null, level: null,
   runtime: null, runtimeValid: false, runtimeErr: null,
   cmdText: "", cmdBusy: false, cmdMsg: null, cmdErr: false, cmdReply: null, cmdTurnId: null,
+  voiceCaps: null, voiceCapsState: "pending", voice: null,
   redacted: false
 };
 
@@ -480,7 +506,7 @@ async function decide(verb) {
 
 async function submitCmd() {
   const text = STATE.cmdText.trim();
-  if (!text || STATE.cmdBusy) return;
+  if (!text || STATE.cmdBusy || (STATE.voice && STATE.voice.busy)) return;
   const speak = $("speakToggle").checked;
   setState({ cmdBusy: true, cmdMsg: null, cmdErr: false, cmdReply: null });
   // A real dispatch can spend up to 30s just waiting on a gated tool's confirmation
@@ -639,6 +665,107 @@ function formatScheduleEvent(event, now) {
 }
 // schedule-format:end
 
+// voice-view:start
+const VOICE_GUIDANCE = {
+  mock: "Mock mode (file://): browser voice is unavailable and no microphone is requested.",
+  failed: "Voice status unavailable. Typed commands still work.",
+  terminal: "Terminal voice is active. Relaunch with jarvis-hud --browser-voice to use the browser microphone.",
+  off: "Voice input is disabled for this launch. Typed commands still work.",
+  voice_model_not_configured: "Voice model is not configured. Typed commands still work.",
+  decoder_unavailable: "Audio decoder (ffmpeg) is unavailable. Typed commands still work.",
+  unsupported: "This browser cannot record a supported audio format here. Typed commands still work.",
+  unavailable: "Browser voice is unavailable. Typed commands still work."
+};
+const VOICE_ERRORS = {
+  permission_denied: "Microphone permission was denied. Allow microphone access for this page in your browser's site settings, then press Start mic.",
+  no_microphone: "No microphone was found.",
+  microphone_unavailable: "The microphone is busy or unavailable.",
+  capture_failed: "Recording failed. Try again.",
+  unsupported_browser: "This browser cannot record a supported audio format.",
+  empty_recording: "Nothing was recorded.",
+  recording_too_large: "The recording exceeded the upload limit.",
+  network_error: "Could not reach the local assistant.",
+  invalid_turn_id: "The voice turn was rejected. Try again.",
+  turn_in_progress: "Another turn is in progress. Typed commands and voice share one conversation.",
+  browser_voice_unavailable: "Browser voice is not enabled for this launch.",
+  voice_model_not_configured: "Voice model is not configured.",
+  decoder_unavailable: "Audio decoder (ffmpeg) is unavailable.",
+  unsupported_audio_type: "The recorded audio format is not supported.",
+  empty_audio: "The recording was empty.",
+  audio_too_large: "The recording exceeded the upload limit.",
+  audio_decode_timeout: "Decoding the recording timed out.",
+  audio_decode_failed: "The recording could not be decoded.",
+  audio_too_long: "The recording was longer than the duration limit.",
+  no_speech_detected: "No speech was detected.",
+  voice_turn_failed: "The voice turn failed.",
+  voice_turn_timeout: "The voice turn timed out.",
+  speech_failed: "The reply is ready, but speech synthesis failed.",
+  speech_busy: "Speech synthesis is busy. Try Play reply again shortly.",
+  playback_failed: "The reply is ready, but playback failed.",
+  autoplay_blocked: "Autoplay was blocked. Press Play reply to hear it."
+};
+const VOICE_PHASE_AUDIO = { requesting: "idle", recording: "listening", processing: "processing", synthesizing: "processing", playing: "speaking" };
+const VOICE_PHASE_NOTES = {
+  requesting: "requesting microphone permission",
+  recording: "recording · Stop & Send, or auto-stop at the duration limit",
+  processing: "uploading · local stt + assistant",
+  synthesizing: "local tts synthesis",
+  playing: "playing reply in this page"
+};
+
+// Pure: derives every browser-voice presentation value from STATE plus a small environment.
+// Local voice state outranks backend runtime status only while the controller owns a turn.
+function computeVoiceView(st, env) {
+  const caps = st.voiceCaps, capsState = st.voiceCapsState, voice = st.voice;
+  const hasCtl = !!env.controller;
+  const busy = !!(voice && voice.busy);
+  const localOwns = !!(voice && (voice.busy || voice.phase === "error"));
+  const mode = caps ? caps.mode : null;
+
+  let guidance = null;
+  if (!hasCtl) {
+    if (capsState === "mock") guidance = VOICE_GUIDANCE.mock;
+    else if (capsState === "failed") guidance = VOICE_GUIDANCE.failed;
+    else if (capsState === "ready" && caps) {
+      if (caps.mode === "terminal") guidance = VOICE_GUIDANCE.terminal;
+      else if (caps.mode === "off") guidance = VOICE_GUIDANCE.off;
+      else if (!caps.available) guidance = VOICE_GUIDANCE[caps.reason] || VOICE_GUIDANCE.unavailable;
+      else guidance = VOICE_GUIDANCE.unsupported;
+    }
+  }
+  let status = guidance || "";
+  if (!guidance && voice) {
+    if (voice.phase === "error") status = VOICE_ERRORS[voice.error] || "Voice error.";
+    else if (voice.notice) status = VOICE_ERRORS[voice.notice] || "";
+    else if (busy) status = VOICE_PHASE_NOTES[voice.phase] || "";
+  }
+
+  return {
+    audioKey: localOwns ? (voice.phase === "error" ? "error" : VOICE_PHASE_AUDIO[voice.phase] || "idle") : null,
+    levelOverride: localOwns,
+    level: localOwns && typeof voice.level === "number" ? voice.level : null,
+    localOwns,
+    phaseNote: busy ? (VOICE_PHASE_NOTES[voice.phase] || null) : null,
+    idleNote: mode === "browser" ? "browser mic · Start mic, then Stop & Send"
+      : mode === "off" ? "voice input off · typed commands only" : null,
+    status,
+    startDisabled: !hasCtl || busy || !!st.cmdBusy || !!env.approvalPending,
+    stopDisabled: !(voice && voice.phase === "recording"),
+    cancelDisabled: !busy,
+    playHidden: !!st.redacted || !(voice && voice.canPlay),
+    stopPlayHidden: !!st.redacted || !(voice && voice.playing),
+    typedDisabled: !!st.cmdBusy || busy,
+    speakDisabled: !!st.cmdBusy || busy,
+    voiceBusy: busy,
+    transcript: voice ? voice.transcript || "" : "",
+    response: voice ? voice.response || "" : "",
+    transcriptHidden: !!st.redacted || !(voice && voice.transcript),
+    replyHidden: !!st.redacted || !(voice && voice.response),
+    cmdReplyHidden: !!st.redacted || !st.cmdReply
+  };
+}
+// voice-view:end
+
 // ---------- Pure presentation computation (was `renderVals()`, unchanged in substance) ----------
 function computeVals() {
   const st = STATE, now = st.now;
@@ -753,11 +880,12 @@ function computeVals() {
 
   // ---- audio + level meter ----
   const runtimeState = st.runtimeValid && st.runtime ? st.runtime.state : null;
-  const runtimeNotice = runtimeState === "error" && RUNTIME_ERRORS[st.runtime.error_code]
+  const vv = computeVoiceView(st, { controller: !!voiceController, approvalPending: !!approval });
+  const runtimeNotice = !vv.localOwns && runtimeState === "error" && RUNTIME_ERRORS[st.runtime.error_code]
     ? RUNTIME_ERRORS[st.runtime.error_code] : null;
-  const aKey = st.runtimeValid ? (runtimeState || "idle") : (st.audio || CONFIG.audioState || "idle");
+  const aKey = vv.audioKey || (st.runtimeValid ? (runtimeState || "idle") : (st.audio || CONFIG.audioState || "idle"));
   const a = AUDIO[aKey] || AUDIO.idle;
-  const lvl = st.level;
+  const lvl = vv.levelOverride ? vv.level : st.level;
   const hasLvl = typeof lvl === "number";
   const SEG = 26;
   const litN = hasLvl ? Math.round(lvl * SEG) : 0;
@@ -767,9 +895,11 @@ function computeVals() {
     const col = near > 0.86 ? "#e0674f" : near > 0.68 ? "#c99a3e" : a.color;
     return { style: "flex:1;min-width:0;height:" + (lit ? 10 : 3) + "px;background:" + (lit ? col : "#1b2124") + ";" };
   });
-  const binding = CONFIG.pttBinding || "fn";
+  // NOTES are static. The idle note is the truthful label: the voice loop owns
+  // the terminal and the user starts/stops each turn with Enter — not a held
+  // push-to-talk modifier.
   const NOTES = {
-    idle: "push-to-talk · hold " + binding,
+    idle: "push-to-talk · Enter in terminal to start/stop",
     listening: "capturing input · stt streaming",
     processing: "dispatching turn · awaiting response",
     speaking: "tts playback active",
@@ -863,18 +993,19 @@ function computeVals() {
     approvalErrorText: st.approvalErr ? "could not reach the backend — " + st.approvalErr : "",
 
     cmdText: st.cmdText,
-    cmdBusy: st.cmdBusy,
-    cmdPlaceholder: st.cmdBusy ? "dispatching…" : "type a command · runs the same pipeline, stt skipped",
+    cmdBusy: vv.typedDisabled,
+    cmdPlaceholder: st.cmdBusy ? "dispatching…" : vv.voiceBusy ? "voice turn in progress…" : "type a command · runs the same pipeline, stt skipped",
     cmdHint: st.cmdMsg ? st.cmdMsg : st.cmdText.trim() ? "↵ send" : "text path",
     cmdHintColor: st.cmdErr ? "#e0674f" : st.cmdMsg ? "#4fe0cf" : "#3f4744",
     cmdSpeak: $("speakToggle") ? $("speakToggle").checked : true,
-    cmdReplyVisible: !!st.cmdReply,
-    cmdReply: st.cmdReply || "",
+    cmdReplyVisible: !vv.cmdReplyHidden,
+    cmdReply: vv.cmdReplyHidden ? "" : (st.cmdReply || ""),
     cmdReplyTag: st.cmdTurnId ? "turn " + st.cmdTurnId : "reply",
 
     audioLabel: a.label,
     audioColor: a.color,
-    audioNote: NOTES[aKey] || NOTES.idle,
+    audioNote: vv.phaseNote || (aKey === "idle" && vv.idleNote) || NOTES[aKey] || NOTES.idle,
+    voice: vv,
     audioDotStyle: "width:12px;height:12px;flex:none;background:" + a.color + ";box-shadow:0 0 14px " + a.glow + ";",
     audioStates: Object.keys(AUDIO).map(k => ({
       short: AUDIO[k].short,
@@ -930,6 +1061,13 @@ function render(vals) {
   $("levelText").textContent = vals.levelText;
   $("levelText").style.color = vals.levelTextColor;
   $("audioNote").textContent = vals.audioNote;
+  const vv = vals.voice;
+  $("voiceStartBtn").disabled = vv.startDisabled;
+  $("voiceStopBtn").disabled = vv.stopDisabled;
+  $("voiceCancelBtn").disabled = vv.cancelDisabled;
+  $("voicePlayBtn").hidden = vv.playHidden;
+  $("voiceStopPlayBtn").hidden = vv.stopPlayHidden;
+  $("voiceStatus").textContent = vv.status;
 
   // schedule
   $("scheduleCountLabel").textContent = vals.scheduleCountLabel;
@@ -1028,6 +1166,11 @@ function render(vals) {
   $("statWindow").textContent = vals.statWindow;
 
   // command bar
+  $("voiceTranscriptBar").hidden = vals.voice.transcriptHidden;
+  $("voiceTranscript").textContent = vals.voice.transcriptHidden ? "" : vals.voice.transcript;
+  $("voiceReplyBar").hidden = vals.voice.replyHidden;
+  $("voiceReply").textContent = vals.voice.replyHidden ? "" : vals.voice.response;
+  $("voiceReply").title = vals.voice.replyHidden ? "" : vals.voice.response;
   $("cmdReplyBar").hidden = !vals.cmdReplyVisible;
   $("cmdReplyTag").textContent = vals.cmdReplyTag;
   $("cmdReply").textContent = vals.cmdReply;
@@ -1068,9 +1211,82 @@ function measure() {
 
 // ---------- Wiring ----------
 $("denyBtn").addEventListener("click", () => decide("deny"));
-$("approveBtn").addEventListener("click", () => decide("approve"));
+$("approveBtn").addEventListener("click", () => decide("allow"));
 $("cmdInput").addEventListener("input", (e) => setState({ cmdText: e.target.value, cmdMsg: null, cmdErr: false, cmdReply: null, cmdTurnId: null }));
 $("cmdInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitCmd(); } });
+
+// ---------- Browser voice (controller lives in voice.js; built only for an available browser-mode capability) ----------
+let voiceController = null;
+
+function validateVoiceCapabilities(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const keys = Object.keys(data).sort().join(",");
+  if (keys !== "accepted_media_types,available,max_duration_seconds,max_upload_bytes,mode,reason") return null;
+  if (data.mode !== "terminal" && data.mode !== "browser" && data.mode !== "off") return null;
+  if (typeof data.available !== "boolean") return null;
+  if (data.reason !== null && typeof data.reason !== "string") return null;
+  if (!Number.isFinite(data.max_duration_seconds) || data.max_duration_seconds <= 0) return null;
+  if (!Number.isFinite(data.max_upload_bytes) || data.max_upload_bytes <= 0) return null;
+  if (!Array.isArray(data.accepted_media_types) || !data.accepted_media_types.every((t) => typeof t === "string")) return null;
+  return data;
+}
+
+function voiceDeps(caps) {
+  return {
+    mediaDevices: navigator.mediaDevices,
+    MediaRecorder: window.MediaRecorder,
+    AudioContext: window.AudioContext || window.webkitAudioContext,
+    fetch: (url, init) => window.fetch(url, init),
+    Blob: window.Blob,
+    Audio: window.Audio,
+    AbortController: window.AbortController,
+    URL: window.URL,
+    setTimeout: (fn, ms) => window.setTimeout(fn, ms),
+    clearTimeout: (id) => window.clearTimeout(id),
+    requestAnimationFrame: (fn) => window.requestAnimationFrame(fn),
+    cancelAnimationFrame: (id) => window.cancelAnimationFrame(id),
+    randomUUID: () => window.crypto.randomUUID(),
+    apiBase: base(),
+    maxUploadBytes: caps.max_upload_bytes,
+    maxDurationSeconds: caps.max_duration_seconds,
+    acceptedMediaTypes: caps.accepted_media_types,
+    speak: () => $("speakToggle").checked,
+    onUpdate: (snapshot) => setState({ voice: snapshot })
+  };
+}
+
+async function loadVoiceCapabilities() {
+  if (STATE.voiceCapsState === "ready" || STATE.voiceCapsState === "mock") return;
+  if (location.protocol === "file:") { setState({ voiceCapsState: "mock" }); return; }
+  const r = await req("/voice-capabilities", undefined, 3000);
+  if (STATE.voiceCapsState === "ready") return;
+  const caps = r.down || r.err ? null : validateVoiceCapabilities(r.data);
+  if (!caps) { setState({ voiceCaps: null, voiceCapsState: "failed" }); return; }
+  if (caps.mode === "browser" && caps.available && !voiceController && window.JarvisVoice
+      && typeof window.crypto === "object" && window.crypto && typeof window.crypto.randomUUID === "function") {
+    const deps = voiceDeps(caps);
+    if (window.JarvisVoice.detectFeatures(deps).supported) {
+      voiceController = window.JarvisVoice.createBrowserVoiceController(deps);
+    }
+  }
+  setState({ voiceCaps: caps, voiceCapsState: "ready" });
+}
+
+function disposeVoice() {
+  if (voiceController) { voiceController.dispose(); voiceController = null; }
+}
+
+$("voiceStartBtn").addEventListener("click", () => {
+  if (!voiceController) return;
+  setState({ cmdReply: null, cmdMsg: null, cmdErr: false });
+  voiceController.start();
+});
+$("voiceStopBtn").addEventListener("click", () => { if (voiceController) voiceController.stopAndSend(); });
+$("voiceCancelBtn").addEventListener("click", () => { if (voiceController) voiceController.cancel(); });
+$("voicePlayBtn").addEventListener("click", () => { if (voiceController) voiceController.play(); });
+$("voiceStopPlayBtn").addEventListener("click", () => { if (voiceController) voiceController.stopPlayback(); });
+window.addEventListener("pagehide", disposeVoice);
+window.addEventListener("unload", disposeVoice);
 
 window.addEventListener("resize", measure);
 window.addEventListener("keydown", (e) => {
@@ -1099,10 +1315,12 @@ setInterval(() => { measure(); setState({ now: Date.now() }); }, 1000);
 setInterval(poll, pollMs());
 setInterval(pollRuntimeStatus, pollMs());
 setInterval(pollApproval, Math.max(500, CONFIG.approvalPollMs || 1000));
+setInterval(loadVoiceCapabilities, pollMs());
 
 poll();
 pollRuntimeStatus();
 pollApproval();
+loadVoiceCapabilities();
 requestAnimationFrame(measure);
 setTimeout(measure, 300);
 scheduleRender();
