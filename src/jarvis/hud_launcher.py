@@ -38,6 +38,7 @@ class _Resources:
         self.server_thread: threading.Thread | None = None
         self.server_thread_started = False
         self.api_process: subprocess.Popen[object] | None = None
+        self.voice_process: subprocess.Popen[object] | None = None
         self.static_error: BaseException | None = None
         self.static_done = threading.Event()
         self.user_stop = threading.Event()
@@ -104,6 +105,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace | None:
     parser.add_argument("--voice-model")
     parser.add_argument("--hud-port", default=str(DEFAULT_HUD_PORT))
     parser.add_argument("--no-browser", action="store_true")
+    voice_group = parser.add_mutually_exclusive_group()
+    voice_group.add_argument(
+        "--browser-voice",
+        action="store_true",
+        help="use browser microphone input instead of terminal voice capture",
+    )
+    voice_group.add_argument("--no-voice", action="store_true", help=argparse.SUPPRESS)
     try:
         args = parser.parse_args(argv)
     except SystemExit:
@@ -116,7 +124,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace | None:
         print("jarvis-hud: HUD port must differ from the API port", file=sys.stderr)
         return None
     args.hud_port = hud_port
+    args.mode = _resolve_voice_input_mode(args)
     return args
+
+
+def _resolve_voice_input_mode(args: argparse.Namespace) -> str:
+    if getattr(args, "browser_voice", False):
+        return "browser"
+    if getattr(args, "no_voice", False):
+        return "off"
+    mode = getattr(args, "mode", None)
+    if mode in {"terminal", "browser", "off"}:
+        return mode
+    return "terminal"
 
 
 def _validate_inherited_api_port(environ: dict[str, str]) -> bool:
@@ -239,7 +259,13 @@ def _cleanup(resources: _Resources) -> None:
         except BaseException:
             pass
 
-    process = resources.api_process
+    _terminate_child(resources.voice_process)
+    _terminate_child(resources.api_process)
+
+
+def _terminate_child(process: subprocess.Popen[object] | None) -> None:
+    """Stop one owned child with bounded retries: terminate, then kill on timeout."""
+
     if process is None:
         return
     try:
@@ -271,12 +297,15 @@ def _cleanup(resources: _Resources) -> None:
 def _run(args: argparse.Namespace, model: Path, root: Path, resources: _Resources) -> int:
     hud_url = f"http://127.0.0.1:{args.hud_port}"
     page_url = f"{hud_url}/index.html"
-    environ = os.environ.copy()
+    mode = _resolve_voice_input_mode(args)
+    inherited = os.environ.copy()
+    environ = inherited.copy()
     environ.update(
         {
             "JARVIS_API_PORT": str(API_PORT),
             "HUD_ORIGIN": hud_url,
             "JARVIS_VOICE_MODEL": str(model),
+            "JARVIS_VOICE_INPUT_MODE": mode,
         }
     )
     handler = _make_handler(root / "hud")
@@ -300,12 +329,17 @@ def _run(args: argparse.Namespace, model: Path, root: Path, resources: _Resource
     if _failure(resources) or resources.user_stop.is_set():
         return 0 if resources.user_stop.is_set() else 1
 
+    terminal_mode = mode == "terminal"
     try:
+        api_kwargs: dict[str, object] = {}
+        if terminal_mode:
+            api_kwargs["stdin"] = subprocess.DEVNULL
         resources.api_process = subprocess.Popen(
             [sys.executable, "-m", "jarvis.api.launcher"],
             cwd=str(root),
             env=environ,
             shell=False,
+            **api_kwargs,
         )
     except Exception:
         print("jarvis-hud: could not start API", file=sys.stderr)
@@ -343,13 +377,49 @@ def _run(args: argparse.Namespace, model: Path, root: Path, resources: _Resource
         if not opened:
             print(f"jarvis-hud: warning: could not open {page_url}", file=sys.stderr)
 
+    if terminal_mode:
+        try:
+            resources.voice_process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "jarvis.orchestrator.voice_loop",
+                    "--voice-model",
+                    str(model),
+                ],
+                cwd=str(root),
+                env=inherited,
+                shell=False,
+            )
+        except Exception:
+            print("jarvis-hud: could not start voice loop", file=sys.stderr)
+            return 1
+
     while not resources.user_stop.is_set():
+        voice_status = _voice_exit_status(resources)
+        if voice_status is not None:
+            print(f"jarvis-hud: voice loop exited (status {voice_status})", file=sys.stderr)
+            return 1
         if _failure(resources):
             print("jarvis-hud: owned server stopped unexpectedly", file=sys.stderr)
             return 1
         resources.wakeup.wait(0.1)
         resources.wakeup.clear()
     return 0
+
+
+def _voice_exit_status(resources: _Resources) -> object | None:
+    """Return the voice child's exit status unless shutdown was requested."""
+
+    if resources.user_stop.is_set():
+        return None
+    process = resources.voice_process
+    if process is None:
+        return None
+    try:
+        return process.poll()
+    except BaseException:
+        return None
 
 
 def main(argv: list[str] | None = None) -> int:

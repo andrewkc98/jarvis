@@ -4,6 +4,7 @@ import asyncio
 import sys
 import time
 from collections.abc import AsyncIterator
+import numpy as np
 from uuid import uuid4
 
 from jarvis.voice import capture, stt
@@ -112,6 +113,10 @@ async def _speak_stream(
     if producer_error:
         raise producer_error[0]
     return "".join(received)
+
+
+class NoSpeechDetectedError(Exception):
+    """STT produced no usable transcript — caller chose not to route the turn."""
 
 
 class JarvisService:
@@ -447,6 +452,44 @@ class JarvisService:
             turn_id=turn_id,
             publish_processing=False,
         )
+
+    async def arun_audio(self, audio: np.ndarray) -> tuple[str, str]:
+        """Transcribe an already-captured 16 kHz waveform and route it through the
+        normal service pipeline without speaking aloud.
+
+        Distinct from :meth:`arun_once`, the audio is supplied by the caller (for
+        example the browser voice pipeline) instead of being captured here. STT runs
+        on a background worker so the event loop stays free for unrelated work, the
+        returned tuple is ``(transcript, response)`` and the reply is not spoken
+        aloud. A cancelled turn clears only its own matching runtime status and never
+        routes or dispatches the partial transcript.
+        """
+        turn_id = self._new_turn_id()
+        self._begin_turn(turn_id)
+        self._publish_status("processing", turn_id)
+        try:
+            stt_start = time.monotonic()
+            transcript = await asyncio.to_thread(stt.transcribe, audio)
+        except asyncio.CancelledError:
+            self._cancel_turn(turn_id)
+            raise
+        except Exception:
+            self._publish_status("stt_failed", turn_id)
+            self._finish_turn(turn_id)
+            raise
+        stt_ms = (time.monotonic() - stt_start) * 1000
+        if not transcript.strip():
+            self._publish_status("stt_failed", turn_id)
+            self._finish_turn(turn_id)
+            raise NoSpeechDetectedError(transcript)
+        response = await self._answer_with_turn(
+            transcript,
+            stt_ms=stt_ms,
+            speak=False,
+            turn_id=turn_id,
+            publish_processing=False,
+        )
+        return transcript, response
 
     async def arun_text(self, text: str) -> str:
         """Speak a supplied text response without using audio capture or STT."""

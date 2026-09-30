@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 from unittest.mock import Mock
 
 import numpy as np
@@ -731,3 +732,230 @@ def test_telemetry_shape_is_independent_of_speak_sdk(monkeypatch):
 
     assert shapes[0] == ("sdk", ["mcp__vault__read"], None)
     assert shapes[1] == shapes[0]
+
+
+def _fake_audio_backend():
+    async def ask_stream(self, prompt):
+        yield f"echo: {prompt}"
+
+    return ask_stream
+
+
+def test_arun_audio_runs_stt_off_loop_and_returns_tuple(monkeypatch):
+    worker_began = asyncio.Event()
+    worker_releases = asyncio.Event()
+    order = []
+
+    def transcribe(audio):
+        order.append(("stt", threading.get_ident()))
+        worker_began.set()
+        # asyncio.Event lacks a sync wait, so poll while staying off the loop.
+        while not worker_releases.is_set():
+            time.sleep(0.01)
+        return "hello jarvis"
+
+    monkeypatch.setattr(stt, "transcribe", transcribe)
+    monkeypatch.setattr(sdk_backend.SDKBackend, "ask_stream", _fake_audio_backend())
+
+    async def main():
+        loop_id = threading.get_ident()
+        task = asyncio.create_task(JarvisService("voice.onnx").arun_audio(np.zeros(160)))
+        await worker_began.wait()
+        order.append(("loop-advanced", loop_id))
+        worker_releases.set()
+        return await task
+
+    transcript, response = asyncio.run(main())
+
+    assert transcript == "hello jarvis"
+    assert response == "echo: hello jarvis"
+    assert isinstance(response, str)
+    assert order[0][0] == "stt"
+    assert order[1][0] == "loop-advanced"
+    assert order[0][1] != order[1][1]  # stt ran off the event loop
+
+
+def test_arun_audio_publishes_exact_status_and_turn_continuity(monkeypatch):
+    calls, owner = _stub_runtime_status(monkeypatch)
+
+    monkeypatch.setattr(stt, "transcribe", Mock(return_value="hello jarvis"))
+    monkeypatch.setattr(sdk_backend.SDKBackend, "ask_stream", _fake_audio_backend())
+
+    asyncio.run(JarvisService("voice.onnx").arun_audio(np.zeros(160)))
+
+    publish_states = [record[2] for record in calls if record[0] == "publish"]
+    fail_states = [record[-1] for record in calls if record[0] == "fail"]
+    turn_ids = set()
+    for record in calls:
+        if record[0] == "publish":
+            turn_ids.add(record[3])
+        elif record[0] == "clear":
+            turn_ids.add(record[2])
+        elif record[0] == "fail":
+            turn_ids.add(record[2])
+    assert len(turn_ids) == 1
+    assert all(record[1] == owner for record in calls)
+    assert publish_states == ["processing"]
+    assert fail_states == []
+
+
+def test_arun_audio_passes_stt_ms_to_answer_with_turn(monkeypatch):
+    captured = {}
+
+    async def record_answer(
+        self,
+        text,
+        *,
+        stt_ms=None,
+        speak=True,
+        turn_id=None,
+        publish_processing=True,
+    ):
+        captured.update(
+            text=text,
+            stt_ms=stt_ms,
+            speak=speak,
+            turn_id=turn_id,
+            publish_processing=publish_processing,
+        )
+        return "response"
+
+    monkeypatch.setattr(JarvisService, "_answer_with_turn", record_answer)
+    monkeypatch.setattr(stt, "transcribe", Mock(return_value="hello jarvis"))
+
+    asyncio.run(JarvisService("voice.onnx").arun_audio(np.zeros(160)))
+
+    assert captured["text"] == "hello jarvis"
+    assert captured["stt_ms"] is not None
+    assert captured["stt_ms"] >= 0
+    assert captured["speak"] is False
+    assert isinstance(captured["turn_id"], str) and captured["turn_id"]
+    assert captured["publish_processing"] is False
+
+
+def test_arun_audio_publishes_no_speech_failure_without_routing(monkeypatch):
+    calls, _owner = _stub_runtime_status(monkeypatch)
+    routed = []
+
+    def transcribe(audio):
+        if routed:
+            raise AssertionError("transcribe called twice")
+        return "   "
+
+    monkeypatch.setattr(stt, "transcribe", transcribe)
+    monkeypatch.setattr(router, "route", lambda text: routed.append(text) or "sdk")
+    ask_calls = []
+
+    def ask_stream(self, prompt):
+        ask_calls.append(prompt)
+        return _fake_ask_stream(["nope"])
+
+    monkeypatch.setattr(sdk_backend.SDKBackend, "ask_stream", ask_stream)
+
+    with pytest.raises(Exception) as error:
+        asyncio.run(JarvisService("voice.onnx").arun_audio(np.zeros(160)))
+
+    from jarvis.orchestrator.service import NoSpeechDetectedError
+
+    assert isinstance(error.value, NoSpeechDetectedError)
+    assert routed == []
+    assert ask_calls == []
+    publish_states = [record[2] for record in calls if record[0] == "publish"]
+    fail_states = [record[-1] for record in calls if record[0] == "fail"]
+    turn_ids = {record[3] if record[0] == "publish" else record[2] for record in calls}
+    assert publish_states[0] == "processing"
+    assert "stt_failed" in (publish_states + fail_states)
+    assert len(turn_ids) == 1
+
+
+def test_arun_audio_re_raises_stt_error_and_marks_stt_failed(monkeypatch):
+    calls, _owner = _stub_runtime_status(monkeypatch)
+    boom = RuntimeError("mlx exploded")
+
+    def transcribe(audio):
+        raise boom
+
+    monkeypatch.setattr(stt, "transcribe", transcribe)
+    routed = []
+    monkeypatch.setattr(router, "route", lambda text: routed.append(text) or "sdk")
+
+    with pytest.raises(RuntimeError) as error:
+        asyncio.run(JarvisService("voice.onnx").arun_audio(np.zeros(160)))
+
+    assert error.value is boom
+    assert routed == []
+    publish_states = [record[2] for record in calls if record[0] == "publish"]
+    fail_states = [record[-1] for record in calls if record[0] == "fail"]
+    turn_ids = {record[3] if record[0] == "publish" else record[2] for record in calls}
+    assert publish_states[0] == "processing"
+    assert "stt_failed" in (publish_states + fail_states)
+    assert len(turn_ids) == 1
+
+
+def test_arun_audio_cancellation_before_dispatch_clears_only_matching_turn(monkeypatch):
+    calls, _owner = _stub_runtime_status(monkeypatch)
+    worker_began = threading.Event()
+    worker_releases = threading.Event()
+
+    def transcribe(audio):
+        worker_began.set()
+        worker_releases.wait()
+        return "late transcript"
+
+    monkeypatch.setattr(stt, "transcribe", transcribe)
+    routed = []
+    monkeypatch.setattr(router, "route", lambda text: routed.append(text) or "sdk")
+    ask_calls = []
+
+    def ask_stream(self, prompt):
+        ask_calls.append(prompt)
+        return _fake_ask_stream(["nope"])
+
+    monkeypatch.setattr(sdk_backend.SDKBackend, "ask_stream", ask_stream)
+    turn_id_holder = {}
+
+    async def main():
+        service = JarvisService("voice.onnx")
+        task = asyncio.create_task(service.arun_audio(np.zeros(160)))
+        await asyncio.to_thread(worker_began.wait)
+        turn_id_holder["id"] = service._active_turn_id
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        # Let the already-running STT worker finish after cancellation.
+        worker_releases.set()
+        return service
+
+    service = asyncio.run(main())
+
+    assert routed == []
+    assert ask_calls == []
+    assert service._active_turn_id is None
+    cleared = [record for record in calls if record[0] == "clear"]
+    assert len(cleared) == 1
+    assert cleared[0] == ("clear", _owner, turn_id_holder["id"])
+
+
+def test_arun_audio_never_touches_capture_or_piper(monkeypatch):
+    capture_calls = []
+    piper_calls = []
+
+    def record_on_enter(**kwargs):
+        capture_calls.append(kwargs)
+        raise AssertionError("capture must not happen for arun_audio")
+
+    monkeypatch.setattr(capture, "record_on_enter", record_on_enter)
+    monkeypatch.setattr(tts.Speaker, "say", lambda self, text: piper_calls.append(text))
+    monkeypatch.setattr(stt, "transcribe", Mock(return_value="hello jarvis"))
+    monkeypatch.setattr(sdk_backend.SDKBackend, "ask_stream", _fake_audio_backend())
+
+    transcript, response = asyncio.run(
+        JarvisService("voice.onnx").arun_audio(np.zeros(160))
+    )
+
+    assert capture_calls == []
+    assert piper_calls == []
+    assert transcript == "hello jarvis"
+    assert response == "echo: hello jarvis"
