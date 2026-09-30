@@ -158,8 +158,9 @@ def test_decode_invokes_ffmpeg_with_safe_argv_and_pipes(monkeypatch) -> None:
     raw = b"captured-recording-bytes"
     audio = media.decode_media(raw, "audio/webm")
 
-    assert captured["argv"] == list(media._FFMPEG_ARGS)
+    assert captured["argv"] == ["/usr/bin/ffmpeg", *media._FFMPEG_ARGS]
     assert captured["argv"] == [
+        "/usr/bin/ffmpeg",
         "-nostdin",
         "-v",
         "quiet",
@@ -175,7 +176,8 @@ def test_decode_invokes_ffmpeg_with_safe_argv_and_pipes(monkeypatch) -> None:
     ]
     # stdin/stdout pipes, shell off, reading from stdin, never a temp/named file.
     assert captured["shell"] is False
-    assert captured["stdin"] is subprocess.PIPE
+    assert captured["stdin"] is None  # input= supplies the pipe; stdin= would raise
+    assert captured["input"] == raw
     assert captured["stdout"] is subprocess.PIPE
     assert captured["stderr"] is not None
     for chunk in ("-i", "-f", "f32le", "-nostdin"):
@@ -321,3 +323,28 @@ def test_raw_input_bytes_and_stderr_are_never_emitted_to_stdout(monkeypatch, cap
     assert secret_input.decode() not in out
     for term in ("audio/webm", "ffmpeg", "f32le"):
         assert term not in out
+
+
+# --------------------------------------------------------------------------- #
+# Real ffmpeg round trip (skipped when ffmpeg/libopus are unavailable)
+# --------------------------------------------------------------------------- #
+
+
+def test_decode_media_real_ffmpeg_webm_opus() -> None:
+    import shutil
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+    encoded = subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+         "-c:a", "libopus", "-f", "webm", "-"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if encoded.returncode != 0 or not encoded.stdout:
+        pytest.skip("ffmpeg cannot encode webm/opus")
+    audio = media.decode_media(encoded.stdout, "audio/webm;codecs=opus")
+    assert audio.dtype == np.float32
+    assert audio.ndim == 1
+    assert 0.8 * media.SAMPLE_RATE <= audio.size <= 1.3 * media.SAMPLE_RATE
+    assert float(np.abs(audio).max()) > 0.1

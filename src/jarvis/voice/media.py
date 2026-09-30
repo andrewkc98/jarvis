@@ -124,7 +124,6 @@ def _decode_ffmpeg(argv: tuple[str, ...], raw: bytes) -> np.ndarray:
         completed = subprocess.run(
             list(argv),
             input=raw,
-            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=False,
@@ -182,5 +181,5 @@ def decode_media(input_bytes: bytes, content_type: str) -> np.ndarray:
     if decoder is None:
         raise NoDecoderError("ffmpeg decoder not available")
 
-    audio = _decode_ffmpeg(_FFMPEG_ARGS, raw)
+    audio = _decode_ffmpeg((decoder, *_FFMPEG_ARGS), raw)
     return audio
